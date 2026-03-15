@@ -21,8 +21,9 @@ import {
 const exec = promisify(execCallback);
 
 // 带 UTF-8 环境变量的 exec，解决后台进程 emoji 问题
-async function execWithUtf8(command: string): Promise<{ stdout: string; stderr: string }> {
+async function execWithUtf8(command: string, options: Record<string, any> = {}): Promise<{ stdout: string; stderr: string }> {
   return exec(command, {
+    ...options,
     env: {
       ...process.env,
       LANG: "en_US.UTF-8",
@@ -245,24 +246,178 @@ function isMediaMessage(content: string): boolean {
   return /^\[(图片|视频|文件|语音)\]/.test(content);
 }
 
-// 判断消息是否需要等待 webhook（长文本或多媒体）
+// 判断消息是否需要 OCR 补全（长文本或多媒体）
 const NOTIFICATION_MAX_LENGTH = 60; // 通知最大显示约 65 字符，留点余量
+const OCR_SCREENSHOT_TIMEOUT_MS = 2000;
+const OCR_RECOGNITION_TIMEOUT_MS = 3000;
+const OCR_TOTAL_TIMEOUT_MS = 5000;
+const OCR_PREFIX_LENGTH = 55;
+const OCR_SCREENSHOT_BIN = "/opt/homebrew/bin/peekaboo";
+const OCR_WECHAT_APP_NAME = "微信";
+const OCR_BINARY_PATH = `${process.env.HOME ?? ""}/.openclaw/workspace/bin/wechat-ocr`;
+const OCR_MESSAGE_SEPARATOR_RE = /^(?:\d{1,2}:\d{2}|昨天|星期[一二三四五六日天]|周[一二三四五六日天]|上午|下午|晚上|凌晨|中午|[a-zA-Z0-9_-]{6,}|.+(?:群聊|服务通知|文件传输助手))$/;
 
 function shouldWaitForWebhook(content: string): boolean {
-  // 多媒体消息需要等待 webhook
   if (isMediaMessage(content)) {
     return true;
   }
-  // 长文本可能被截断，需要等待 webhook
   if (content.length >= NOTIFICATION_MAX_LENGTH) {
     return true;
   }
   return false;
 }
 
-// 待处理的通知消息（等待 webhook 补全）
-const pendingNotifications = new Map<string, { sender: string; content: string; timestamp: number }>();
-const PENDING_TIMEOUT_MS = 30000; // 30 秒后如果 webhook 还没来，直接发送
+function shellEscape(value: string): string {
+  return `'${value.replace(/'/g, `'\''`)}'`;
+}
+
+function normalizeOcrLine(line: string): string {
+  return line
+    .replace(/[\u200b-\u200d\ufeff]/g, "")
+    .replace(/\s+/g, "")
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/[，]/g, ",")
+    .replace(/[。]/g, ".")
+    .replace(/[：]/g, ":")
+    .replace(/[；]/g, ";")
+    .replace(/[（]/g, "(")
+    .replace(/[）]/g, ")")
+    .replace(/[【]/g, "[")
+    .replace(/[】]/g, "]")
+    .replace(/[！]/g, "!")
+    .replace(/[？]/g, "?")
+    .replace(/[、]/g, ",")
+    .replace(/[—–]/g, "-")
+    .replace(/[……]/g, "...")
+    .trim();
+}
+
+function buildOcrPrefixes(rawContent: string): string[] {
+  const prefixes = new Set<string>();
+  const candidates = [
+    rawContent,
+    rawContent.replace(/…+$/g, ""),
+    rawContent.replace(/\.\.\.+$/g, ""),
+  ];
+  const groupMatch = rawContent.match(/^(.+?)[:：]\s*(.+)$/s);
+  if (groupMatch) {
+    candidates.push(groupMatch[2]);
+    candidates.push(groupMatch[2].replace(/…+$/g, ""));
+    candidates.push(groupMatch[2].replace(/\.\.\.+$/g, ""));
+  }
+  for (const candidate of candidates) {
+    const normalized = normalizeOcrLine(candidate);
+    if (!normalized) continue;
+    prefixes.add(normalized.slice(0, OCR_PREFIX_LENGTH));
+    prefixes.add(normalized.slice(0, Math.max(24, Math.min(40, normalized.length))));
+  }
+  return Array.from(prefixes).filter((item) => item.length >= 12).sort((a, b) => b.length - a.length);
+}
+
+function extractFullContentFromOcr(ocrText: string, notificationContent: string, sender: string, log: (...args: any[]) => void): string | null {
+  const lines = ocrText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return null;
+
+  const prefixes = buildOcrPrefixes(notificationContent);
+  if (prefixes.length === 0) return null;
+
+  const normalizedLines = lines.map((line) => normalizeOcrLine(line));
+  let best: { start: number; end: number; content: string; prefix: string } | null = null;
+
+  for (let start = 0; start < lines.length; start += 1) {
+    let combined = "";
+    for (let end = start; end < Math.min(lines.length, start + 8); end += 1) {
+      const currentLine = lines[end].trim();
+      if (end > start && OCR_MESSAGE_SEPARATOR_RE.test(currentLine) && combined.length > 0) {
+        break;
+      }
+      combined += normalizedLines[end];
+      for (const prefix of prefixes) {
+        if (combined.includes(prefix)) {
+          best = {
+            start,
+            end,
+            content: lines.slice(start, end + 1).join("\n"),
+            prefix,
+          };
+          break;
+        }
+      }
+      if (best) break;
+    }
+    if (best) break;
+  }
+
+  if (!best) {
+    const joined = normalizedLines.join("\n");
+    for (const prefix of prefixes) {
+      const index = joined.indexOf(prefix);
+      if (index >= 0) {
+        log(`[wechat-ocr] Prefix matched in joined OCR text for ${sender}, but could not isolate message bubble`);
+        return lines.join("\n");
+      }
+    }
+    return null;
+  }
+
+  const content = best.content.trim();
+  log(`[wechat-ocr] Matched OCR message for ${sender} at lines ${best.start + 1}-${best.end + 1} with prefix length ${best.prefix.length}`);
+  return content;
+}
+
+async function enrichNotificationWithOcr(sender: string, content: string, log: (...args: any[]) => void): Promise<string> {
+  if (!shouldWaitForWebhook(content) || isMediaMessage(content)) {
+    return content;
+  }
+
+  const screenshotPath = `/tmp/wechat-ocr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.png`;
+  const screenshotBin = existsSync(OCR_SCREENSHOT_BIN) ? OCR_SCREENSHOT_BIN : "peekaboo";
+  const startedAt = Date.now();
+
+  try {
+    const screenshotCmd = `${screenshotBin} image --app ${shellEscape(OCR_WECHAT_APP_NAME)} --path ${shellEscape(screenshotPath)}`;
+    await execWithUtf8(screenshotCmd, { timeout: OCR_SCREENSHOT_TIMEOUT_MS });
+
+    if (!existsSync(OCR_BINARY_PATH)) {
+      log(`[wechat-ocr] OCR binary not found: ${OCR_BINARY_PATH}`);
+      return content;
+    }
+
+    const { stdout } = await execWithUtf8(`${shellEscape(OCR_BINARY_PATH)} ${shellEscape(screenshotPath)}`, {
+      timeout: OCR_RECOGNITION_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+    });
+
+    const extracted = extractFullContentFromOcr(stdout, content, sender, log);
+    if (!extracted) {
+      log(`[wechat-ocr] No OCR match for ${sender}, using notification content`);
+      return content;
+    }
+
+    const normalizedOriginal = normalizeOcrLine(content.replace(/…+$/g, "").replace(/\.\.\.+$/g, ""));
+    const normalizedExtracted = normalizeOcrLine(extracted);
+    if (normalizedExtracted.length <= normalizedOriginal.length) {
+      log(`[wechat-ocr] OCR result not longer than notification for ${sender}, keeping original content`);
+      return content;
+    }
+
+    log(`[wechat-ocr] Replaced truncated notification for ${sender} in ${Date.now() - startedAt}ms`);
+    return extracted;
+  } catch (err) {
+    log(`[wechat-ocr] OCR fallback failed for ${sender}: ${String(err)}`);
+    return content;
+  } finally {
+    try {
+      await execWithUtf8(`rm -f ${shellEscape(screenshotPath)}`);
+    } catch {
+      // ignore cleanup failure
+    }
+  }
+}
 
 // 通知监控进程
 let notificationMonitorProcess: ChildProcess | null = null;
@@ -1386,29 +1541,8 @@ async function handleWechatWebhookRequest(
       continue;
     }
 
-    // 检查是否在 pending 中（通知收到了但等待 webhook 完整内容）
-    // 通知只能获取截断的内容，用前20字符匹配
-    let foundPendingKey: string | null = null;
-    for (const [key, pending] of pendingNotifications.entries()) {
-      if (pending.sender === senderName) {
-        // 检查 webhook 内容是否以 pending 内容开头（通知内容可能被截断）
-        if (content.startsWith(pending.content) || pending.content.startsWith(content.slice(0, 20))) {
-          foundPendingKey = key;
-          break;
-        }
-      }
-    }
-
-    if (foundPendingKey) {
-      // 找到 pending 消息，用 webhook 的完整内容替换并处理
-      log(`[wechat-webhook] Found pending notification, using webhook content: ${senderName}`);
-      pendingNotifications.delete(foundPendingKey);
-      markMessageProcessed(senderName, content);
-    } else {
-      // 不在 pending 中，也没被处理过，直接处理
-      log(`[wechat-webhook] New message from webhook: ${senderName}`);
-      markMessageProcessed(senderName, content);
-    }
+    log(`[wechat-webhook] New message from webhook: ${senderName}`);
+    markMessageProcessed(senderName, content);
 
     const senderId = msg.sender || msg.talker || "unknown";
     const chatId = msg.talker || msg.sender || "unknown";
@@ -1625,50 +1759,25 @@ const wechatPlugin = {
           // 通知监控不做去重检查，收到就处理
           // 去重只在 webhook 端做，防止 webhook 重复处理已被通知处理过的消息
 
-          // 判断是否需要等待 webhook
+          let finalContent = content;
           if (shouldWaitForWebhook(content)) {
-            // 长文本或多媒体消息：记录到 pending，等待 webhook 提供完整内容
-            const pendingKey = getMessageKey(sender, content);
-            pendingNotifications.set(pendingKey, {
-              sender,
-              content,
-              timestamp: Date.now(),
-            });
-            log(`[wechat-notify] Message may be truncated/media, waiting for webhook: ${sender}: ${content.slice(0, 30)}...`);
-
-            // 设置超时：如果 30 秒后 webhook 还没来，就用通知的内容发送
-            setTimeout(async () => {
-              const pending = pendingNotifications.get(pendingKey);
-              if (pending) {
-                log(`[wechat-notify] Webhook timeout, processing with notification content: ${sender}`);
-                pendingNotifications.delete(pendingKey);
-                
-                // 标记为已处理
-                markMessageProcessed(sender, content);
-
-                // 多媒体消息不能仅从通知获取，跳过
-                if (isMediaMessage(content)) {
-                  log(`[wechat-notify] Media message cannot be processed from notification, skipped`);
-                  return;
-                }
-
-                // 发送给 Agent
-                try {
-                  await processNotificationMessage(sender, content);
-                } catch (err) {
-                  error(`[wechat-notify] Failed to process message: ${err}`);
-                }
-              }
-            }, PENDING_TIMEOUT_MS);
-            return;
+            if (isMediaMessage(content)) {
+              log(`[wechat-notify] Media message cannot be recovered from notification OCR, skipped: ${sender}`);
+              return;
+            }
+            log(`[wechat-notify] Attempting OCR recovery for truncated notification: ${sender}: ${content.slice(0, 30)}...`);
+            finalContent = await Promise.race([
+              enrichNotificationWithOcr(sender, content, log),
+              new Promise<string>((resolve) => setTimeout(() => resolve(content), OCR_TOTAL_TIMEOUT_MS)),
+            ]);
+          } else {
+            log(`[wechat-notify] Processing short message directly: ${sender}: ${content}`);
           }
 
-          // 短文本：直接处理
-          log(`[wechat-notify] Processing short message directly: ${sender}: ${content}`);
-          markMessageProcessed(sender, content);
+          markMessageProcessed(sender, finalContent);
 
           try {
-            await processNotificationMessage(sender, content);
+            await processNotificationMessage(sender, finalContent);
           } catch (err) {
             error(`[wechat-notify] Failed to process message: ${err}`);
           }
