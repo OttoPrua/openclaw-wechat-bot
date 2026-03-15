@@ -55,7 +55,7 @@ const WECHAT_MAX_MEDIA_PER_MESSAGE = 9;
 
 // 将 AI 输出的相对路径转为绝对路径
 const OPENCLAW_PATH_ALIASES: [string, string][] = [
-  ["openclaw/workspace", "/Users/clawdbot/.openclaw/workspace"],
+  ["openclaw/workspace", "/Users/ottoprua/.openclaw/workspace"],
 ];
 
 function normalizeFilePath(filePath: string): string {
@@ -139,9 +139,83 @@ function detectLocalFilePaths(text: string): string[] {
 let runtime: PluginRuntime | null = null;
 let pluginApi: OpenClawPluginApi | null = null;
 
+// 动态激活的群聊名称（通过 ！洛茜 指令绑定）
+let activeGroup: string = "";
+
+// 系统消息前缀：用于区分「静默处理的系统/上下文消息」和「需要正常回复的用户消息」
+// 可在 channels.wechat.systemMessagePrefix 中覆盖，默认使用固定 UUID 前缀方便跨 agent 共享
+const DEFAULT_SYSTEM_MESSAGE_PREFIX = "OC_SYS_6c7c0f8d-4d27-4d3d-9d93-c7c9d4b8d11a";
+
 // 消息去重：存储已处理的消息 key（发送者 + 内容前20字符）
 const processedMessages = new Set<string>();
 const MAX_PROCESSED_MESSAGES = 1000;
+
+// ============================================================
+// 频率限制 & Token 预算
+// ============================================================
+
+// 每分钟消息计数（滑动窗口）
+const messageTimestamps: number[] = [];
+
+// 每日 Token 估算追踪
+let dailyTokenEstimate = 0;
+let dailyTokenResetDate = new Date().toDateString();
+
+function resetDailyTokenIfNeeded(): void {
+  const today = new Date().toDateString();
+  if (today !== dailyTokenResetDate) {
+    dailyTokenEstimate = 0;
+    dailyTokenResetDate = today;
+  }
+}
+
+// 估算 token 数（中文约 1.5 token/字，英文约 0.75 token/word）
+function estimateTokens(text: string): number {
+  const chineseChars = (text.match(/[\u4e00-\u9fff]/g) || []).length;
+  const otherChars = text.length - chineseChars;
+  return Math.ceil(chineseChars * 1.5 + otherChars * 0.3);
+}
+
+function addTokenUsage(inputText: string, outputText: string): void {
+  resetDailyTokenIfNeeded();
+  dailyTokenEstimate += estimateTokens(inputText) + estimateTokens(outputText);
+}
+
+type RateLimitResult =
+  | { allowed: true }
+  | { allowed: false; reason: "per_minute"; retryAfterSec: number }
+  | { allowed: false; reason: "daily_budget"; usedTokens: number; budgetTokens: number };
+
+function checkRateLimit(cfg: any): RateLimitResult {
+  const wechatCfg = (cfg?.channels?.wechat) ?? {};
+  const perMinute: number = wechatCfg.rateLimitPerMinute ?? 5;
+  const dailyBudget: number = wechatCfg.dailyTokenBudget ?? 500000;
+
+  // 每分钟检查
+  const now = Date.now();
+  const oneMinuteAgo = now - 60_000;
+  // 清理旧记录
+  while (messageTimestamps.length > 0 && messageTimestamps[0] < oneMinuteAgo) {
+    messageTimestamps.shift();
+  }
+  if (messageTimestamps.length >= perMinute) {
+    const oldestInWindow = messageTimestamps[0];
+    const retryAfterSec = Math.ceil((oldestInWindow + 60_000 - now) / 1000);
+    return { allowed: false, reason: "per_minute", retryAfterSec };
+  }
+
+  // 每日 token 检查
+  resetDailyTokenIfNeeded();
+  if (dailyTokenEstimate >= dailyBudget) {
+    return { allowed: false, reason: "daily_budget", usedTokens: dailyTokenEstimate, budgetTokens: dailyBudget };
+  }
+
+  return { allowed: true };
+}
+
+function recordMessageSent(): void {
+  messageTimestamps.push(Date.now());
+}
 
 // 生成消息去重 key
 function getMessageKey(sender: string, content: string): string {
@@ -203,54 +277,49 @@ async function startNotificationMonitor(
   log(`[wechat-notify] Starting notification monitor...`);
 
   // AppleScript 脚本：持续监控 NotificationCenter 窗口
+  // macOS Tahoe 通知 UI 结构:
+  // window "Notification Center" > group 1 > group 1 > scroll area 1 > group 1 > group N > {static text 1 (sender), static text 2 (body)}
   const appleScript = `
     on run
-      set lastSender to ""
-      set lastContent to ""
+      set lastMessages to {}
       repeat
         try
           tell application "System Events"
             tell process "NotificationCenter"
-              if (count of windows) > 0 then
-                set notifWindow to window "Notification Center"
-                if exists notifWindow then
-                  tell notifWindow
-                    if exists group 1 then
-                      tell group 1
-                        if exists group 1 then
+              if exists window "Notification Center" then
+                tell window "Notification Center"
+                  tell group 1
+                    tell group 1
+                      if exists scroll area 1 then
+                        tell scroll area 1
                           tell group 1
-                            if exists scroll area 1 then
-                              tell scroll area 1
-                                if exists group 1 then
-                                  tell group 1
-                                    set senderText to ""
-                                    set bodyText to ""
-                                    repeat with staticText in (every static text)
-                                      set textValue to value of staticText
-                                      if senderText is "" then
-                                        set senderText to textValue
-                                      else if bodyText is "" then
-                                        set bodyText to textValue
+                            set notifGroups to every group
+                            repeat with notifGroup in notifGroups
+                              try
+                                set allTexts to value of every static text of notifGroup
+                                if (count of allTexts) >= 2 then
+                                  set senderText to item 1 of allTexts as text
+                                  set bodyText to item 2 of allTexts as text
+                                  if senderText is not "" and bodyText is not "" then
+                                    set msgKey to senderText & "|||" & bodyText
+                                    if msgKey is not in lastMessages then
+                                      set end of lastMessages to msgKey
+                                      -- Keep lastMessages from growing too large
+                                      if (count of lastMessages) > 50 then
+                                        set lastMessages to items 26 thru -1 of lastMessages
                                       end if
-                                    end repeat
-                                    -- 只有当发送者和内容都不为空，且与上次不同时才输出
-                                    if senderText is not "" and bodyText is not "" then
-                                      if senderText is not lastSender or bodyText is not lastContent then
-                                        set lastSender to senderText
-                                        set lastContent to bodyText
-                                        log "NOTIFICATION:" & senderText & "|||" & bodyText
-                                      end if
+                                      log "NOTIFICATION:" & senderText & "|||" & bodyText
                                     end if
-                                  end tell
+                                  end if
                                 end if
-                              end tell
-                            end if
+                              end try
+                            end repeat
                           end tell
-                        end if
-                      end tell
-                    end if
+                        end tell
+                      end if
+                    end tell
                   end tell
-                end if
+                end tell
               end if
             end tell
           end tell
@@ -293,6 +362,17 @@ function stopNotificationMonitor(): void {
     notificationMonitorProcess.kill();
     notificationMonitorProcess = null;
   }
+}
+
+function getSystemMessagePrefix(cfg: any): string {
+  const raw = cfg?.channels?.wechat?.systemMessagePrefix;
+  if (typeof raw === "string" && raw.trim()) return raw.trim();
+  return DEFAULT_SYSTEM_MESSAGE_PREFIX;
+}
+
+function buildSilentContextMessage(cfg: any, senderName: string, content: string): string {
+  const prefix = getSystemMessagePrefix(cfg);
+  return `${prefix} [微信群静默上下文] 以下消息仅供上下文理解，除非后续有明确触发，否则不要直接回复。发送者：${senderName}；内容：${content}`;
 }
 
 function setWechatRuntime(next: PluginRuntime) {
@@ -351,37 +431,56 @@ function stripMarkdown(text: string): string {
 // 微信操作原子函数（用于图文混发）
 // ============================================================
 
-// 激活微信窗口并准备输入
-async function activateWeChatInput(): Promise<void> {
+// 激活微信窗口，发送到当前激活的聊天
+async function activateWeChatInput(targetChat?: string): Promise<void> {
   const log = pluginApi?.logger?.info?.bind(pluginApi?.logger) ?? console.log;
 
-  // 1. 确保微信在前台并有窗口
   log(`[wechat-op] Activating WeChat...`);
   await execWithUtf8(`osascript -e '
-    tell application "WeChat"
-      activate
-      reopen
+    tell application "System Events"
+      set frontmost of process "WeChat" to true
     end tell
   '`);
 
-  // 2. 等待窗口完全激活
   await new Promise((resolve) => setTimeout(resolve, 500));
 
-  // 3. 按 2 次 Cmd+↓ 确保激活聊天窗口/输入框
-  log(`[wechat-op] Focusing chat input...`);
-  for (let i = 0; i < 2; i++) {
+  if (targetChat?.trim()) {
+    const escapedTarget = escapeForShell(targetChat.trim());
+    log(`[wechat-op] Switching to target chat: ${targetChat}`);
+    await execWithUtf8(`printf '%s' '${escapedTarget}' | pbcopy`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
     await execWithUtf8(`osascript -e '
       tell application "System Events"
         tell process "WeChat"
-          key code 125 using {command down}
+          key code 3 using {command down}
+          delay 0.2
+          key code 9 using {command down}
+          delay 0.3
+          key code 36
+          delay 0.4
+          key code 53
         end tell
       end tell
     '`);
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, 350));
   }
+}
 
-  // 4. 等待输入框获得焦点
-  await new Promise((resolve) => setTimeout(resolve, 100));
+type ClipboardSnapshot = { text: string | null };
+
+async function captureClipboardSnapshot(): Promise<ClipboardSnapshot> {
+  try {
+    const { stdout } = await execWithUtf8(`pbpaste`);
+    return { text: stdout };
+  } catch {
+    return { text: null };
+  }
+}
+
+async function restoreClipboardSnapshot(snapshot: ClipboardSnapshot): Promise<void> {
+  if (snapshot.text === null) return;
+  const escapedText = escapeForShell(snapshot.text);
+  await execWithUtf8(`printf '%s' '${escapedText}' | pbcopy`);
 }
 
 // 粘贴文字，不发送（全部使用剪贴板粘贴）
@@ -483,14 +582,16 @@ function splitIntoBatches(parts: MessagePart[]): MessagePart[][] {
   return batches;
 }
 
-async function sendMixedContent(parts: MessagePart[]): Promise<{ ok: boolean; error?: string }> {
+async function sendMixedContent(parts: MessagePart[], targetChat?: string): Promise<{ ok: boolean; error?: string }> {
   const log = pluginApi?.logger?.info?.bind(pluginApi?.logger) ?? console.log;
   const error = pluginApi?.logger?.error?.bind(pluginApi?.logger) ?? console.error;
+  let clipboardSnapshot: ClipboardSnapshot | null = null;
 
   try {
+    clipboardSnapshot = await captureClipboardSnapshot();
     // 统计媒体数量
     const mediaCount = parts.filter((p) => p.type === "media").length;
-    log(`[wechat-mixed] Starting to send ${parts.length} parts (${mediaCount} media files)...`);
+    log(`[wechat-mixed] Starting to send ${parts.length} parts (${mediaCount} media files) to ${targetChat ?? "current chat"}...`);
 
     // 分批处理
     const batches = splitIntoBatches(parts);
@@ -501,8 +602,8 @@ async function sendMixedContent(parts: MessagePart[]): Promise<{ ok: boolean; er
       const batchMediaCount = batch.filter((p) => p.type === "media").length;
       log(`[wechat-mixed] Processing batch ${batchIndex + 1}/${batches.length} (${batch.length} parts, ${batchMediaCount} media)`);
 
-      // 1. 激活微信并准备输入
-      await activateWeChatInput();
+      // 1. 激活微信并切换到目标聊天
+      await activateWeChatInput(targetChat);
 
       // 2. 依次粘贴当前批次的每个部分（不发送）
       for (let i = 0; i < batch.length; i++) {
@@ -538,6 +639,10 @@ async function sendMixedContent(parts: MessagePart[]): Promise<{ ok: boolean; er
     const errorMsg = err instanceof Error ? err.message : String(err);
     error(`[wechat-mixed] Failed: ${errorMsg}`);
     return { ok: false, error: errorMsg };
+  } finally {
+    if (clipboardSnapshot) {
+      await restoreClipboardSnapshot(clipboardSnapshot);
+    }
   }
 }
 
@@ -551,37 +656,35 @@ async function sendToWeChat(text: string): Promise<{ ok: boolean; messageId?: st
 
   // 清理 Markdown 格式
   const cleanText = stripMarkdown(text);
+  let clipboardSnapshot: ClipboardSnapshot | null = null;
 
   try {
+    clipboardSnapshot = await captureClipboardSnapshot();
     log(`[wechat-send] Starting to send message (${cleanText.length} chars): ${cleanText.substring(0, 50)}...`);
 
     // 1. 确保微信在前台并有窗口
     log(`[wechat-send] Activating WeChat and ensuring window is open...`);
     await execWithUtf8(`osascript -e '
-      tell application "WeChat"
-        activate
-        reopen
+      tell application "System Events"
+        set frontmost of process "WeChat" to true
       end tell
     '`);
 
     // 2. 等待窗口完全激活
     await new Promise((resolve) => setTimeout(resolve, 500));
 
-    // 3. 按 2 次 Cmd+↓ 确保激活聊天窗口/输入框
-    log(`[wechat-send] Activating chat input (Cmd+Down)...`);
-    for (let i = 0; i < 2; i++) {
-      await execWithUtf8(`osascript -e '
-        tell application "System Events"
-          tell process "WeChat"
-            key code 125 using {command down}
-          end tell
+    // 3. Cmd+↓ 再 Cmd+↑ 聚焦到第一个聊天输入框
+    log(`[wechat-send] Focusing first chat input (Cmd+Down then Cmd+Up)...`);
+    await execWithUtf8(`osascript -e '
+      tell application "System Events"
+        tell process "WeChat"
+          key code 125 using {command down}
+          delay 0.1
+          key code 126 using {command down}
         end tell
-      '`);
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-
-    // 4. 等待输入框获得焦点
-    await new Promise((resolve) => setTimeout(resolve, 100));
+      end tell
+    '`);
+    await new Promise((resolve) => setTimeout(resolve, 200));
 
     // 5. 使用剪贴板粘贴
     log(`[wechat-send] Pasting text (${cleanText.length} chars)...`);
@@ -622,6 +725,10 @@ async function sendToWeChat(text: string): Promise<{ ok: boolean; messageId?: st
     const errorMsg = err instanceof Error ? err.message : String(err);
     error(`[wechat-send] Failed to send message: ${errorMsg}`);
     return { ok: false, error: errorMsg };
+  } finally {
+    if (clipboardSnapshot) {
+      await restoreClipboardSnapshot(clipboardSnapshot);
+    }
   }
 }
 
@@ -629,37 +736,35 @@ async function sendToWeChat(text: string): Promise<{ ok: boolean; messageId?: st
 async function sendMediaToWeChat(mediaPath: string): Promise<{ ok: boolean; messageId?: string; error?: string }> {
   const log = pluginApi?.logger?.info?.bind(pluginApi?.logger) ?? console.log;
   const error = pluginApi?.logger?.error?.bind(pluginApi?.logger) ?? console.error;
+  let clipboardSnapshot: ClipboardSnapshot | null = null;
 
   try {
+    clipboardSnapshot = await captureClipboardSnapshot();
     log(`[wechat-send-media] Starting to send media: ${mediaPath}`);
 
     // 1. 确保微信在前台并有窗口
     log(`[wechat-send-media] Activating WeChat and ensuring window is open...`);
     await execWithUtf8(`osascript -e '
-      tell application "WeChat"
-        activate
-        reopen
+      tell application "System Events"
+        set frontmost of process "WeChat" to true
       end tell
     '`);
 
     // 2. 等待窗口完全激活
     await new Promise((resolve) => setTimeout(resolve, 500));
 
-    // 3. 按 2 次 Cmd+↓ 确保激活聊天窗口/输入框
-    log(`[wechat-send-media] Activating chat input (Cmd+Down)...`);
-    for (let i = 0; i < 2; i++) {
-      await execWithUtf8(`osascript -e '
-        tell application "System Events"
-          tell process "WeChat"
-            key code 125 using {command down}
-          end tell
+    // 3. Cmd+↓ 再 Cmd+↑ 聚焦到第一个聊天输入框
+    log(`[wechat-send-media] Focusing first chat input (Cmd+Down then Cmd+Up)...`);
+    await execWithUtf8(`osascript -e '
+      tell application "System Events"
+        tell process "WeChat"
+          key code 125 using {command down}
+          delay 0.1
+          key code 126 using {command down}
         end tell
-      '`);
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-
-    // 4. 等待输入框获得焦点
-    await new Promise((resolve) => setTimeout(resolve, 100));
+      end tell
+    '`);
+    await new Promise((resolve) => setTimeout(resolve, 200));
 
     // 5. 用 AppleScript 把文件复制到剪贴板
     log(`[wechat-send-media] Copying file to clipboard...`);
@@ -705,6 +810,10 @@ async function sendMediaToWeChat(mediaPath: string): Promise<{ ok: boolean; mess
     const errorMsg = err instanceof Error ? err.message : String(err);
     error(`[wechat-send-media] Failed to send media: ${errorMsg}`);
     return { ok: false, error: errorMsg };
+  } finally {
+    if (clipboardSnapshot) {
+      await restoreClipboardSnapshot(clipboardSnapshot);
+    }
   }
 }
 
@@ -872,9 +981,9 @@ function createWechatReplyDispatcher(params: CreateWechatReplyDispatcherParams) 
       }
     }
 
-    runtimeEnv.log?.(`wechat deliver flush: ${parts.length} parts (text=${hasText}, extraMedia=${extraMediaPaths?.length ?? 0})`);
+    runtimeEnv.log?.(`wechat deliver flush: ${parts.length} parts (text=${hasText}, extraMedia=${extraMediaPaths?.length ?? 0}) target=${chatId}`);
 
-    const result = await sendMixedContent(parts);
+    const result = await sendMixedContent(parts, chatId);
     if (!result.ok) {
       runtimeEnv.error?.(`wechat deliver failed: ${result.error}`);
     }
@@ -890,6 +999,11 @@ function createWechatReplyDispatcher(params: CreateWechatReplyDispatcherParams) 
       onReplyStart: typingCallbacks.onReplyStart,
       deliver: async (payload: ReplyPayload) => {
         runtimeEnv.log?.(`wechat deliver called: text=${payload.text?.slice(0, 100)}`);
+
+        // ── Token 用量追踪（输出侧） ──
+        if (payload.text) {
+          addTokenUsage("", payload.text);
+        }
 
         // 提取框架传入的媒体路径（mediaUrls 优先，fallback mediaUrl）
         const payloadAny = payload as any;
@@ -987,7 +1101,78 @@ async function handleWechatMessage(params: {
   const log = runtimeEnv.log ?? console.log;
   const error = runtimeEnv.error ?? console.error;
 
-  log(`wechat: received message from ${ctx.senderName} in ${ctx.chatId}`);
+  log(`wechat: received message from ${ctx.senderName} in ${ctx.chatId} (type: ${ctx.chatType})`);
+
+  // ── 群聊限定：私聊消息直接忽略 ──
+  const wechatCfg = (cfg as any)?.channels?.wechat ?? {};
+  const groupOnly: boolean = wechatCfg.groupOnly ?? true;
+  if (groupOnly && ctx.chatType !== "group") {
+    log(`wechat: ignoring DM (groupOnly=true)`);
+    return;
+  }
+
+  // ── 动态激活群 + 绑定指令 ──
+  const bindTrigger: string = wechatCfg.bindTrigger ?? "！洛茜";
+  if (ctx.content.trim() === bindTrigger) {
+    // ！洛茜 指令：将当前群设为激活群
+    activeGroup = ctx.chatId;
+    log(`wechat: 🔗 bound active group to "${ctx.chatId}"`);
+    await sendToWeChat(`✅ 已绑定到「${ctx.chatId}」，现在可以用 ＆洛茜 跟我聊天啦！`);
+    return;
+  }
+
+  // ── 群名过滤：只响应激活群 ──
+  if (activeGroup && ctx.chatId !== activeGroup) {
+    log(`wechat: group "${ctx.chatId}" is not active group "${activeGroup}", skipping`);
+    return;
+  }
+  if (!activeGroup) {
+    // 未绑定任何群，回退到 allowedGroups 配置
+    const allowedGroups: string[] = wechatCfg.allowedGroups ?? [];
+    if (allowedGroups.length > 0 && !allowedGroups.some((g: string) => ctx.chatId.includes(g))) {
+      log(`wechat: group "${ctx.chatId}" not in allowedGroups and no active group, skipping`);
+      return;
+    }
+  }
+
+  // ── 触发符检测（群聊） ──
+  // 使用自定义触发符（如 ＆洛茜）代替 @mention，因为微信通知会吞掉 @ 后的实际内容
+  const botTrigger: string = wechatCfg.botTrigger ?? "＆洛茜";
+  let wasMentioned = false;
+  if (ctx.chatType === "group" && botTrigger) {
+    const triggerPattern = new RegExp(`${botTrigger.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`);
+    if (triggerPattern.test(ctx.content)) {
+      wasMentioned = true;
+      // 去掉触发符前缀
+      ctx.content = ctx.content.replace(triggerPattern, "").trim();
+      if (!ctx.content) {
+        ctx.content = "你好";
+      }
+      log(`wechat: trigger matched, content after strip: ${ctx.content.slice(0, 50)}`);
+    } else {
+      // 无触发符：消息仍传入 session 作为上下文，洛茜自行判断是否回复
+      log(`wechat: group message without trigger, passing as context (sender=${ctx.senderName})`);
+    }
+  }
+
+  // ── 频率限制检查 ──
+  const rateLimitResult = checkRateLimit(cfg);
+  if (!rateLimitResult.allowed) {
+    let limitMsg = "";
+    if (rateLimitResult.reason === "per_minute") {
+      limitMsg = `⏳ 请求太频繁，请 ${rateLimitResult.retryAfterSec} 秒后再试`;
+    } else if (rateLimitResult.reason === "daily_budget") {
+      const usedK = Math.round(rateLimitResult.usedTokens / 1000);
+      const budgetK = Math.round(rateLimitResult.budgetTokens / 1000);
+      limitMsg = `🚫 今日用量已达上限（${usedK}K / ${budgetK}K tokens），明天再来吧`;
+    }
+    log(`wechat: rate limited (${rateLimitResult.reason}), sending notice`);
+    await sendToWeChat(limitMsg);
+    return;
+  }
+
+  // 记录本次请求
+  recordMessageSent();
 
   try {
     const core = getWechatRuntime();
@@ -1005,12 +1190,17 @@ async function handleWechatMessage(params: {
       },
     });
 
-    // 生成独立的 sessionKey，确保每个微信用户/群有独立的 session
-    // 格式：wechat:dm:用户名 或 wechat:group:群ID
-    const sessionKey = `wechat:${ctx.chatType === "group" ? "group" : "dm"}:${ctx.chatId}`;
+    // ── Token 用量追踪（输入侧） ──
+    const inputTokenEstimate = estimateTokens(ctx.content);
 
-    // 直接使用纯消息内容，不添加任何前缀或格式
-    const body = ctx.content;
+    // 生成独立的 sessionKey，确保每个微信用户/群有独立的 session
+    // 格式：agent:agentId:wechat:group:群ID（包含 agentId 以确保路由到正确的 agent）
+    const sessionKey = `agent:${route.agentId}:wechat:${ctx.chatType === "group" ? "group" : "dm"}:${ctx.chatId}`;
+
+    // 构建消息体：被触发时按用户消息处理；未触发时注入系统前缀，作为静默上下文传给 agent
+    const body = wasMentioned
+      ? ctx.content
+      : buildSilentContextMessage(cfg, ctx.senderName, ctx.content);
 
     const ctxPayload = core.channel.reply.finalizeInboundContext({
       Body: body,
@@ -1027,7 +1217,7 @@ async function handleWechatMessage(params: {
       Surface: "wechat" as const,
       MessageSid: ctx.messageId,
       Timestamp: Date.now(),
-      WasMentioned: false,
+      WasMentioned: wasMentioned,
       CommandAuthorized: true,
       OriginatingChannel: "wechat" as const,
       OriginatingTo: wechatTo,
@@ -1053,9 +1243,10 @@ async function handleWechatMessage(params: {
 
     log(`wechat: dispatch complete (queuedFinal=${queuedFinal}, replies=${counts.final}, delivered=${wasDelivered()})`);
 
-    // 只有当 deliver 从未被调用（AI 真的没有任何输出）时才发 ⏹️
-    if (!queuedFinal && counts.final === 0 && !wasDelivered()) {
-      log(`wechat: no replies sent, sending stop notification`);
+    // 只有当被直接触发但没有任何输出时才发 ⏹️
+    // 非触发消息（上下文消息）没有回复是正常的，不需要提示
+    if (wasMentioned && !queuedFinal && counts.final === 0 && !wasDelivered()) {
+      log(`wechat: no replies sent for triggered message, sending stop notification`);
       await sendToWeChat("⏹️");
     }
   } catch (err) {
@@ -1375,18 +1566,45 @@ const wechatPlugin = {
       };
 
       // 辅助函数：从通知数据创建消息并发送给 Agent
+      // 微信群通知格式：sender = 群名, body = "发送者: 消息内容" 或 "发送者在群聊中@了你"
       async function processNotificationMessage(sender: string, content: string): Promise<void> {
         const messageId = `wechat-notify-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        const senderId = sender;
-        const chatId = sender; // 通知中无法获取 chatId，用 sender 代替
+
+        // 检测是否为群聊消息：body 中包含 "发送者: 内容" 格式
+        // 微信群通知的 body 格式：
+        //   "张三: 消息内容"
+        //   "张三在群聊中@了你"
+        //   "张三: @扫拖一体🤖 消息内容"
+        const groupMessageMatch = content.match(/^(.+?)[:：]\s*(.+)$/s);
+        const groupMentionMatch = content.match(/^(.+?)在群聊中@了你$/);
+
+        let chatType: "direct" | "group" = "direct";
+        let senderName = sender;
+        let chatId = sender;
+        let actualContent = content;
+
+        if (groupMessageMatch) {
+          // "发送者: 内容" 格式 → 群聊
+          chatType = "group";
+          senderName = groupMessageMatch[1].trim();
+          chatId = sender; // sender 是群名
+          actualContent = groupMessageMatch[2].trim();
+        } else if (groupMentionMatch) {
+          // "发送者在群聊中@了你" → 旧式 @mention 通知，无实际内容，忽略
+          // 用户应使用 ＆洛茜 触发符代替 @
+          log(`[wechat-notify] @mention notification without content, ignoring (use trigger symbol instead)`);
+          return;
+        }
+
+        log(`[wechat-notify] Parsed: chatType=${chatType}, group=${chatId}, sender=${senderName}, content=${actualContent.slice(0, 50)}`);
 
         const messageCtx: WechatMessageContext = {
           chatId,
           messageId,
-          senderId,
-          senderName: sender,
-          chatType: "direct", // 通知中无法判断，默认私聊
-          content,
+          senderId: senderName,
+          senderName,
+          chatType,
+          content: actualContent,
         };
 
         await handleWechatMessage({ cfg, ctx: messageCtx, runtimeEnv });
@@ -1490,17 +1708,18 @@ const plugin = {
     // 注册 channel
     api.registerChannel({ plugin: wechatPlugin as any });
 
-    // 注册 HTTP handler
-    api.registerHttpHandler(async function wechatWebhookHandler(
-      req: IncomingMessage,
-      res: ServerResponse
-    ): Promise<boolean> {
-      return await handleWechatWebhookRequest(
-        req,
-        res,
-        api.config as ClawdbotConfig,
-        api.runtime as unknown as RuntimeEnv
-      );
+    // 注册 HTTP route（webhook 接收端）
+    api.registerHttpRoute({
+      path: "/api/webhook",
+      auth: "plugin",
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        await handleWechatWebhookRequest(
+          req,
+          res,
+          api.config as ClawdbotConfig,
+          api.runtime as unknown as RuntimeEnv
+        );
+      },
     });
 
     api.logger.info("WeChat Webhook channel plugin activated. Listening for webhooks on /api/webhook");
