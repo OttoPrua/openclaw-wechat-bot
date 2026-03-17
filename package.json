@@ -1,0 +1,12 @@
+{
+  "name": "wechat",
+  "version": "0.1.0",
+  "description": "WeChat channel plugin for OpenClaw via macOS UI automation",
+  "main": "index.ts",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

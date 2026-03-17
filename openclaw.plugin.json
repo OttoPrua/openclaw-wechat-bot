@@ -1,16 +1,11 @@
 {
   "id": "wechat",
-  "name": "WeChat Webhook Channel",
-  "description": "Receives WeChat messages via Webhook and sends replies via AppleScript+Peekaboo.",
+  "name": "WeChat Channel",
+  "description": "Receives WeChat messages via macOS notifications and sends via AppleScript UI automation.",
   "channels": ["wechat"],
-  "openclaw": {
-    "extensions": [
-      "./index.ts"
-    ]
-  },
   "configSchema": {
     "type": "object",
-    "additionalProperties": false,
+    "additionalProperties": true,
     "properties": {}
   }
 }

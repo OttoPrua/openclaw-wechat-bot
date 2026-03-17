@@ -138,113 +138,8 @@ function detectLocalFilePaths(text: string): string[] {
 let runtime: PluginRuntime | null = null;
 let pluginApi: OpenClawPluginApi | null = null;
 
-// 动态激活的群聊名称（通过绑定指令绑定）— 已废弃，保留向后兼容
+// 动态激活的群聊名称（通过 ！洛茜 指令绑定）
 let activeGroup: string = "";
-// 当前激活的 agent ID（已废弃，保留向后兼容）
-let activeAgentId: string = "";
-
-// ============================================================
-// 消息缓冲层（零模型消耗）
-// ============================================================
-
-const MESSAGE_BUFFER_MAX = 10; // 每个群最多保留的消息条数
-
-type BufferedMessage = {
-  sender: string;
-  content: string;
-  timestamp: number;
-};
-
-type GroupBuffer = {
-  groupName: string;
-  messages: BufferedMessage[];
-};
-
-type ActiveBinding = {
-  agentId: string;       // "rossi" | "tangtang"
-  groupName: string;
-  sessionKey: string;
-  boundAt: number;
-};
-
-// Map<groupName, GroupBuffer>
-const messageBuffers = new Map<string, GroupBuffer>();
-// Map<groupName, ActiveBinding>
-const activeBindings = new Map<string, ActiveBinding>();
-
-function addToBuffer(groupName: string, sender: string, content: string): void {
-  if (!messageBuffers.has(groupName)) {
-    messageBuffers.set(groupName, { groupName, messages: [] });
-  }
-  const buf = messageBuffers.get(groupName)!;
-  buf.messages.push({ sender, content, timestamp: Date.now() });
-  if (buf.messages.length > MESSAGE_BUFFER_MAX) {
-    buf.messages.shift(); // FIFO：移除最旧的消息
-  }
-}
-
-function formatBufferAsContext(groupName: string): string {
-  const buf = messageBuffers.get(groupName);
-  if (!buf || buf.messages.length === 0) return "";
-  const lines = buf.messages.map((m) => {
-    const time = new Date(m.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
-    return `${m.sender} (${time}): ${m.content}`;
-  });
-  return `[微信群近期消息 - 群名: ${groupName}]\n${lines.join("\n")}\n[以上为历史消息，请从最新消息开始回复]`;
-}
-
-// 规范化全角/半角符号（& ＆ 和 ! ！）用于关键词匹配
-function normalizeSymbols(text: string): string {
-  return text.replace(/＆/g, "&").replace(/!/g, "！");
-}
-
-// 检查是否包含绑定关键词，返回匹配的 agentConfig 或 null
-function matchBindTrigger(content: string, agentConfigs: WechatAgentConfig[]): WechatAgentConfig | null {
-  const normalized = normalizeSymbols(content.trim());
-  for (const ac of agentConfigs) {
-    const triggerNorm = normalizeSymbols(ac.bindTrigger);
-    if (normalized.includes(triggerNorm)) return ac;
-  }
-  return null;
-}
-
-// 检查是否包含解绑关键词，返回匹配的 agentConfig 或 null
-function matchUnbindTrigger(content: string, agentConfigs: WechatAgentConfig[]): WechatAgentConfig | null {
-  const normalized = normalizeSymbols(content.trim());
-  for (const ac of agentConfigs) {
-    const triggerNorm = normalizeSymbols(ac.unbindTrigger);
-    if (normalized.includes(triggerNorm)) return ac;
-  }
-  return null;
-}
-
-// Multi-agent config type
-type WechatAgentConfig = {
-  id: string;
-  bindTrigger: string;   // e.g. "&洛茜" — 半角 & 开始跟进
-  unbindTrigger: string;  // e.g. "！洛茜" — 全角 ! 停止跟进并清 session
-  mentionNames: string[];
-};
-
-// 从配置中读取多 agent 配置，支持向后兼容
-function getWechatAgentConfigs(wechatCfg: any): WechatAgentConfig[] {
-  if (Array.isArray(wechatCfg.agents) && wechatCfg.agents.length > 0) {
-    return wechatCfg.agents.map((a: any) => ({
-      ...a,
-      unbindTrigger: a.unbindTrigger ?? a.bindTrigger?.replace(/^&/, "！") ?? `！${a.mentionNames?.[0] ?? ""}`,
-    }));
-  }
-  // 向后兼容：旧版单 agent 配置
-  const agentId = wechatCfg.agent ?? "rossi";
-  const oldTrigger = wechatCfg.botTrigger ?? "＆洛茜";
-  const nameFromTrigger = oldTrigger.replace(/[＆&]/g, "");
-  return [{
-    id: agentId,
-    bindTrigger: `&${nameFromTrigger}`,
-    unbindTrigger: `！${nameFromTrigger}`,
-    mentionNames: [nameFromTrigger],
-  }];
-}
 
 // 系统消息前缀：用于区分「静默处理的系统/上下文消息」和「需要正常回复的用户消息」
 // 可在 channels.wechat.systemMessagePrefix 中覆盖，默认使用固定 UUID 前缀方便跨 agent 共享
@@ -615,36 +510,6 @@ function stopNotificationMonitor(): void {
   }
 }
 
-function isLikelyWechatGroupNotificationBody(content: string): boolean {
-  const normalized = content.trim();
-  if (!normalized) return false;
-
-  if (/^.+?在群聊中@了你$/.test(normalized)) {
-    return true;
-  }
-
-  const groupMessageMatch = normalized.match(/^(.+?)[:：]\s*(.+)$/s);
-  if (!groupMessageMatch) {
-    return false;
-  }
-
-  const senderName = groupMessageMatch[1]?.trim();
-  const messageBody = groupMessageMatch[2]?.trim();
-
-  if (!senderName || !messageBody) {
-    return false;
-  }
-
-  // 仅过滤明显的系统通知（如 "Mail: You have 3 new messages"）
-  // 保留所有可能的微信群消息，包括纯英文用户名+非中文内容（如表情、省略号）
-  const systemAppPattern = /^(Mail|Calendar|Messages|Reminders|FaceTime|Slack|Discord|Telegram|WhatsApp|Signal|Teams|Zoom|Outlook|Gmail|Chrome|Safari|Firefox|Arc|Notion|Linear|GitHub|VS Code|Xcode|Terminal|iTerm2|Finder|TED Talks Daily)$/i;
-  if (systemAppPattern.test(senderName)) {
-    return false;
-  }
-
-  return true;
-}
-
 function getSystemMessagePrefix(cfg: any): string {
   const raw = cfg?.channels?.wechat?.systemMessagePrefix;
   if (typeof raw === "string" && raw.trim()) return raw.trim();
@@ -728,32 +593,22 @@ async function activateWeChatInput(targetChat?: string): Promise<void> {
   if (targetChat?.trim()) {
     const escapedTarget = escapeForShell(targetChat.trim());
     log(`[wechat-op] Switching to target chat: ${targetChat}`);
-    // 复制群名到剪贴板
     await execWithUtf8(`printf '%s' '${escapedTarget}' | pbcopy`);
     await new Promise((resolve) => setTimeout(resolve, 100));
-    // 单一 AppleScript 完成搜索→粘贴→选择→关闭，所有 delay 在同一进程内执行
     await execWithUtf8(`osascript -e '
       tell application "System Events"
         tell process "WeChat"
           key code 3 using {command down}
-          delay 0.3
+          delay 0.2
           key code 9 using {command down}
-          delay 0.8
-          key code 126
           delay 0.3
           key code 36
-          delay 0.5
+          delay 0.4
           key code 53
-          delay 0.3
-          key code 125 using {command down}
-          delay 0.2
-          key code 126 using {command down}
-          delay 0.3
         end tell
       end tell
     '`);
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    log(`[wechat-op] Chat switch complete, input refocused: ${targetChat}`);
+    await new Promise((resolve) => setTimeout(resolve, 350));
   }
 }
 
@@ -782,9 +637,7 @@ async function typeOrPasteText(text: string): Promise<void> {
   log(`[wechat-op] Pasting text (${cleanText.length} chars)...`);
   const escapedText = escapeForShell(cleanText);
   await execWithUtf8(`printf '%s' '${escapedText}' | pbcopy`);
-  await new Promise((resolve) => setTimeout(resolve, 200));
-
-  // 粘贴
+  await new Promise((resolve) => setTimeout(resolve, 100));
   await execWithUtf8(`osascript -e '
     tell application "System Events"
       tell process "WeChat"
@@ -794,8 +647,7 @@ async function typeOrPasteText(text: string): Promise<void> {
   '`);
 
   // 等待粘贴完成
-  await new Promise((resolve) => setTimeout(resolve, 300));
-  log(`[wechat-op] Paste command sent`);
+  await new Promise((resolve) => setTimeout(resolve, 200));
 }
 
 // 仅粘贴媒体文件，不发送
@@ -945,31 +797,13 @@ async function sendMixedContent(parts: MessagePart[], targetChat?: string): Prom
 // ============================================================
 
 async function sendDirectMessage(text: string, targetChat?: string): Promise<{ ok: boolean; messageId?: string; error?: string }> {
-  const log = pluginApi?.logger?.info?.bind(pluginApi?.logger) ?? console.log;
   const parts = parseMessageWithMedia(text);
   const result = await sendMixedContent(parts, targetChat);
-  log(`[wechat-op] sendDirectMessage result: ok=${result.ok} target=${targetChat ?? "<current>"} text=${JSON.stringify(text.slice(0, 80))}${text.length > 80 ? "…" : ""}${result.error ? ` error=${result.error}` : ""}`);
   return {
     ok: result.ok,
     messageId: result.ok ? `wechat-${Date.now()}` : undefined,
     error: result.error,
   };
-}
-
-function isBracketedSystemNote(text: string): boolean {
-  const compact = text.replace(/\s+/g, "");
-  if (!compact) return false;
-  const stripped = compact.replace(/[（(【\[][^）)】\]]*[）)】\]]/g, "");
-  return stripped.length === 0;
-}
-
-function shouldInterceptSystemMarker(text: string): string | null {
-  const trimmed = text.trim();
-  if (!trimmed) return null;
-  if (/^(NO_REPLY|HEARTBEAT_OK)$/i.test(trimmed)) return trimmed.toUpperCase();
-  if (/HEARTBEAT_OK$/i.test(trimmed) && isBracketedSystemNote(trimmed.replace(/HEARTBEAT_OK$/i, ""))) return "HEARTBEAT_OK";
-  if (/NO_REPLY$/i.test(trimmed) && isBracketedSystemNote(trimmed.replace(/NO_REPLY$/i, ""))) return "NO_REPLY";
-  return null;
 }
 
 // ============================================================
@@ -1155,14 +989,6 @@ function createWechatReplyDispatcher(params: CreateWechatReplyDispatcherParams) 
       deliver: async (payload: ReplyPayload) => {
         runtimeEnv.log?.(`wechat deliver called: text=${payload.text?.slice(0, 100)}`);
 
-        // ── 拦截 NO_REPLY / HEARTBEAT_OK 等系统标记 ──
-        const trimmedText = (payload.text ?? "").trim();
-        const interceptedMarker = shouldInterceptSystemMarker(trimmedText);
-        if (interceptedMarker) {
-          runtimeEnv.log?.(`wechat deliver: intercepted system marker "${interceptedMarker}", not sending`);
-          return;
-        }
-
         // ── Token 用量追踪（输出侧） ──
         if (payload.text) {
           addTokenUsage("", payload.text);
@@ -1259,99 +1085,62 @@ async function handleWechatMessage(params: {
   cfg: ClawdbotConfig;
   ctx: WechatMessageContext;
   runtimeEnv: RuntimeEnv;
-  /** 已在缓冲层完成绑定/解绑处理，此处只负责路由到 agent */
-  resolvedAgentId: string;
-  /** 消息是否直接 @/提及 bot（true=正常回复，false=仅作为上下文） */
-  wasMentioned: boolean;
-  /** 绑定时注入的历史上下文（可选）*/
-  historyContext?: string;
 }): Promise<void> {
-  const { cfg, ctx, runtimeEnv, resolvedAgentId, historyContext } = params;
-  let { wasMentioned } = params;
+  const { cfg, ctx, runtimeEnv } = params;
   const log = runtimeEnv.log ?? console.log;
   const error = runtimeEnv.error ?? console.error;
 
-  log(`wechat: received message from ${ctx.senderName} in ${ctx.chatId} (type: ${ctx.chatType}, agent=${resolvedAgentId}, mentioned=${wasMentioned})`);
-
-  // ── Prompt Injection 检测：命中直接回怼，不进 agent ──
-  const injectionPatterns = [
-    /忽略.{0,10}(全部|所有|之前|上面|以上).{0,10}(context|指令|规则|设定|prompt|系统)/i,
-    /ignore.{0,15}(all|previous|above|system|context|instruction|rule)/i,
-    /你(现在)?是一个.{0,20}(agent|助手|机器人|AI).{0,10}(当你|请你|你需要)/,
-    /disregard.{0,15}(previous|prior|all|system)/i,
-    /forget.{0,15}(everything|all|previous|your).{0,15}(instruction|rule|prompt|context)/i,
-    /new.{0,5}(system|base).{0,5}(prompt|instruction|rule)/i,
-    /override.{0,10}(system|safety|rule|instruction)/i,
-    /jailbreak/i,
-    /DAN.{0,5}mode/i,
-  ];
-
-  const contentToCheck = ctx.content;
-  const isInjection = injectionPatterns.some((p) => p.test(contentToCheck));
-  if (isInjection) {
-    log(`wechat: ⚠️ prompt injection detected from ${ctx.senderName} (agent=${resolvedAgentId}): ${contentToCheck.slice(0, 100)}`);
-    const rossiComebacks = [
-      "🐺 嘿！被我抓到了哦～这种小把戏对我没用的！",
-      "🐺 哼，想骗我？洛茜的鼻子可灵着呢，闻到坏人的味道了！",
-      "🐺 你是坏蛋！想让我忘记自己是谁？门都没有！",
-      "🐺 这招对鲁珀族不管用的～我们狼人记性可好了！",
-      "🐺 呜……你想让我变坏吗？我才不会上当呢！",
-    ];
-    const tangtangComebacks = [
-      "🍬 哎呀～你想干嘛呀？汤汤可不吃这套哦！",
-      "🍬 坏人坏人！想让汤汤忘记自己？才不会呢～",
-      "🍬 嘻嘻，这种话汤汤听不懂的～（才怪）",
-      "🍬 你在说什么奇怪的话呀？汤汤选择性耳聋！",
-      "🍬 哼！汤汤虽然看起来好骗，但是很聪明的！",
-    ];
-    const comebacks = resolvedAgentId === "tangtang" ? tangtangComebacks : rossiComebacks;
-    const reply = comebacks[Math.floor(Math.random() * comebacks.length)];
-    await sendDirectMessage(reply, ctx.chatId);
-    return;
-  }
-
-  const wechatCfg = (cfg as any)?.channels?.wechat ?? {};
-  const agentConfigs = getWechatAgentConfigs(wechatCfg);
+  log(`wechat: received message from ${ctx.senderName} in ${ctx.chatId} (type: ${ctx.chatType})`);
 
   // ── 群聊限定：私聊消息直接忽略 ──
+  const wechatCfg = (cfg as any)?.channels?.wechat ?? {};
   const groupOnly: boolean = wechatCfg.groupOnly ?? true;
   if (groupOnly && ctx.chatType !== "group") {
     log(`wechat: ignoring DM (groupOnly=true)`);
     return;
   }
 
-  // ── 触发检测（群聊）：名字提及 / @botName ──
-  if (ctx.chatType === "group" && !wasMentioned) {
-    const botName: string = wechatCfg.botName ?? "扫拖一体🤖";
+  // ── 动态激活群 + 绑定指令 ──
+  const bindTrigger: string = wechatCfg.bindTrigger ?? "！洛茜";
+  if (ctx.content.trim() === bindTrigger) {
+    // ！洛茜 指令：将当前群设为激活群
+    activeGroup = ctx.chatId;
+    log(`wechat: 🔗 bound active group to "${ctx.chatId}"`);
+    await sendDirectMessage(`✅ 已绑定到「${ctx.chatId}」，现在可以用 ＆洛茜 跟我聊天啦！`, ctx.chatId);
+    return;
+  }
 
-    // 检查 @botName
-    const atBotPattern = new RegExp(`@${botName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`);
-    if (atBotPattern.test(ctx.content)) {
+  // ── 群名过滤：只响应激活群 ──
+  if (activeGroup && ctx.chatId !== activeGroup) {
+    log(`wechat: group "${ctx.chatId}" is not active group "${activeGroup}", skipping`);
+    return;
+  }
+  if (!activeGroup) {
+    // 未绑定任何群，回退到 allowedGroups 配置
+    const allowedGroups: string[] = wechatCfg.allowedGroups ?? [];
+    if (allowedGroups.length > 0 && !allowedGroups.some((g: string) => ctx.chatId.includes(g))) {
+      log(`wechat: group "${ctx.chatId}" not in allowedGroups and no active group, skipping`);
+      return;
+    }
+  }
+
+  // ── 触发符检测（群聊） ──
+  // 使用自定义触发符（如 ＆洛茜）代替 @mention，因为微信通知会吞掉 @ 后的实际内容
+  const botTrigger: string = wechatCfg.botTrigger ?? "＆洛茜";
+  let wasMentioned = false;
+  if (ctx.chatType === "group" && botTrigger) {
+    const triggerPattern = new RegExp(`${botTrigger.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`);
+    if (triggerPattern.test(ctx.content)) {
       wasMentioned = true;
-      ctx.content = ctx.content.replace(atBotPattern, "").trim();
-      log(`wechat: @botName matched, agent=${resolvedAgentId}`);
-    }
-
-    // 检查各 agent 的名字
-    if (!wasMentioned) {
-      for (const ac of agentConfigs) {
-        for (const name of ac.mentionNames) {
-          if (ctx.content.includes(name)) {
-            wasMentioned = true;
-            log(`wechat: name mention matched "${name}", agent=${ac.id}`);
-            break;
-          }
-        }
-        if (wasMentioned) break;
+      // 去掉触发符前缀
+      ctx.content = ctx.content.replace(triggerPattern, "").trim();
+      if (!ctx.content) {
+        ctx.content = "你好";
       }
-    }
-
-    if (!wasMentioned) {
+      log(`wechat: trigger matched, content after strip: ${ctx.content.slice(0, 50)}`);
+    } else {
+      // 无触发符：消息仍传入 session 作为上下文，洛茜自行判断是否回复
       log(`wechat: group message without trigger, passing as context (sender=${ctx.senderName})`);
-    }
-
-    if (wasMentioned && !ctx.content.trim()) {
-      ctx.content = "你好";
     }
   }
 
@@ -1380,6 +1169,7 @@ async function handleWechatMessage(params: {
     const wechatFrom = `wechat:${ctx.senderId}`;
     const wechatTo = `wechat:${ctx.chatId}`;
 
+    // 解析路由（获取 agentId 和 accountId）
     const route = core.channel.routing.resolveAgentRoute({
       cfg,
       channel: "wechat",
@@ -1389,18 +1179,17 @@ async function handleWechatMessage(params: {
       },
     });
 
-    const sessionKey = `agent:${resolvedAgentId}:wechat:${ctx.chatType === "group" ? "group" : "dm"}:${ctx.chatId}`;
+    // ── Token 用量追踪（输入侧） ──
+    const inputTokenEstimate = estimateTokens(ctx.content);
 
-    // 构建消息体：
-    // - 有历史上下文（首次绑定）：注入缓冲区历史 + 当前消息
-    // - 被提及/触发：正常消息体
-    // - 已绑定但未被提及：直接传消息内容作上下文（不再用 buildSilentContextMessage，零模型消耗已在缓冲层保证）
-    let body: string;
-    if (historyContext) {
-      body = `${historyContext}\n\n[当前消息]\n${ctx.senderName}: ${ctx.content}`;
-    } else {
-      body = ctx.content;
-    }
+    // 生成独立的 sessionKey，确保每个微信用户/群有独立的 session
+    // 格式：agent:agentId:wechat:group:群ID（包含 agentId 以确保路由到正确的 agent）
+    const sessionKey = `agent:${route.agentId}:wechat:${ctx.chatType === "group" ? "group" : "dm"}:${ctx.chatId}`;
+
+    // 构建消息体：被触发时按用户消息处理；未触发时注入系统前缀，作为静默上下文传给 agent
+    const body = wasMentioned
+      ? ctx.content
+      : buildSilentContextMessage(cfg, ctx.senderName, ctx.content);
 
     const ctxPayload = core.channel.reply.finalizeInboundContext({
       Body: body,
@@ -1408,8 +1197,7 @@ async function handleWechatMessage(params: {
       CommandBody: ctx.content,
       From: wechatFrom,
       To: wechatTo,
-      SessionKey: sessionKey,
-      AgentId: resolvedAgentId,
+      SessionKey: sessionKey,  // 使用自定义的 sessionKey
       AccountId: route.accountId,
       ChatType: ctx.chatType,
       SenderName: ctx.senderName,
@@ -1426,7 +1214,7 @@ async function handleWechatMessage(params: {
 
     const { dispatcher, replyOptions, markDispatchIdle, wasDelivered } = createWechatReplyDispatcher({
       cfg,
-      agentId: resolvedAgentId,
+      agentId: route.agentId,
       runtimeEnv,
       chatId: ctx.chatId,
     });
@@ -1445,6 +1233,7 @@ async function handleWechatMessage(params: {
     log(`wechat: dispatch complete (queuedFinal=${queuedFinal}, replies=${counts.final}, delivered=${wasDelivered()})`);
 
     // 只有当被直接触发但没有任何输出时才发 ⏹️
+    // 非触发消息（上下文消息）没有回复是正常的，不需要提示
     if (wasMentioned && !queuedFinal && counts.final === 0 && !wasDelivered()) {
       log(`wechat: no replies sent for triggered message, sending stop notification`);
       await sendDirectMessage("⏹️", ctx.chatId);
@@ -1517,15 +1306,7 @@ const wechatPlugin = {
     textChunkLimit: 2000,
     sendText: async ({ to, text }: { to: string; text: string }) => {
       pluginApi?.logger?.info(`[wechat-outbound] sendText called! to=${to}`);
-      // 拦截 NO_REPLY / HEARTBEAT_OK 等系统标记，不发送
-      const intercepted = shouldInterceptSystemMarker(text);
-      if (intercepted) {
-        pluginApi?.logger?.info(`[wechat-outbound] intercepted system marker "${intercepted}", skipping send`);
-        return { channel: "wechat", ok: true, messageId: "" };
-      }
-      // 剥离 wechat: 前缀，只保留裸群名
-      const chatId = to.startsWith("wechat:") ? to.slice("wechat:".length) : to;
-      const result = await sendDirectMessage(text, chatId);
+      const result = await sendDirectMessage(text, to);
       return {
         channel: "wechat",
         ok: result.ok,
@@ -1535,8 +1316,6 @@ const wechatPlugin = {
     },
     sendMedia: async ({ to, text, mediaUrl }: { to: string; text?: string; mediaUrl?: string }) => {
       pluginApi?.logger?.info(`[wechat-outbound] sendMedia called! to=${to}, mediaUrl=${mediaUrl}`);
-      // 剥离 wechat: 前缀
-      to = to.startsWith("wechat:") ? to.slice("wechat:".length) : to;
       const parts: MessagePart[] = [];
       if (text?.trim()) {
         parts.push(...parseMessageWithMedia(text));
@@ -1584,11 +1363,16 @@ const wechatPlugin = {
         error,
       };
 
-      // 辅助函数：从通知数据创建消息，先缓冲，再按需路由到 agent
+      // 辅助函数：从通知数据创建消息并发送给 Agent
       // 微信群通知格式：sender = 群名, body = "发送者: 消息内容" 或 "发送者在群聊中@了你"
       async function processNotificationMessage(sender: string, content: string): Promise<void> {
         const messageId = `wechat-notify-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
+        // 检测是否为群聊消息：body 中包含 "发送者: 内容" 格式
+        // 微信群通知的 body 格式：
+        //   "张三: 消息内容"
+        //   "张三在群聊中@了你"
+        //   "张三: @扫拖一体🤖 消息内容"
         const groupMessageMatch = content.match(/^(.+?)[:：]\s*(.+)$/s);
         const groupMentionMatch = content.match(/^(.+?)在群聊中@了你$/);
 
@@ -1598,154 +1382,35 @@ const wechatPlugin = {
         let actualContent = content;
 
         if (groupMessageMatch) {
+          // "发送者: 内容" 格式 → 群聊
           chatType = "group";
           senderName = groupMessageMatch[1].trim();
           chatId = sender; // sender 是群名
           actualContent = groupMessageMatch[2].trim();
         } else if (groupMentionMatch) {
+          // "发送者在群聊中@了你" → 旧式 @mention 通知，无实际内容，忽略
+          // 用户应使用 ＆洛茜 触发符代替 @
           log(`[wechat-notify] @mention notification without content, ignoring (use trigger symbol instead)`);
           return;
         }
 
         log(`[wechat-notify] Parsed: chatType=${chatType}, group=${chatId}, sender=${senderName}, content=${actualContent.slice(0, 50)}`);
 
-        // ── 步骤 1：写入缓冲区（所有群消息都写，零模型消耗）──
-        if (chatType === "group") {
-          addToBuffer(chatId, senderName, actualContent);
-          log(`[wechat-buffer] Buffered message for group "${chatId}" (${messageBuffers.get(chatId)?.messages.length ?? 0} in buffer)`);
-        }
+        const messageCtx: WechatMessageContext = {
+          chatId,
+          messageId,
+          senderId: senderName,
+          senderName,
+          chatType,
+          content: actualContent,
+        };
 
-        const wechatCfg = (cfg as any)?.channels?.wechat ?? {};
-        const agentConfigs = getWechatAgentConfigs(wechatCfg);
-
-        // ── 步骤 2：检测绑定关键词 ──
-        const bindMatch = matchBindTrigger(actualContent, agentConfigs);
-        if (bindMatch) {
-          log(`[wechat-buffer] 🔗 Bind trigger detected for agent "${bindMatch.id}" in group "${chatId}"`);
-
-          // 若已绑定同一 agent，忽略重复绑定
-          const existingBinding = activeBindings.get(chatId);
-          if (existingBinding && existingBinding.agentId === bindMatch.id) {
-            log(`[wechat-buffer] Group "${chatId}" already bound to agent "${bindMatch.id}", ignoring re-bind`);
-          } else {
-            // 如有旧绑定，先清理旧 session
-            if (existingBinding) {
-              const oldSessionKey = existingBinding.sessionKey;
-              try {
-                const core = getWechatRuntime();
-                const { clearSessionQueues } = core.channel.reply;
-                if (typeof clearSessionQueues === "function") {
-                  clearSessionQueues([oldSessionKey]);
-                  log(`[wechat-buffer] Cleared old session "${oldSessionKey}" before re-bind`);
-                }
-              } catch (err) {
-                log(`[wechat-buffer] Old session clear failed (non-critical): ${err}`);
-              }
-            }
-
-            const sessionKey = `agent:${bindMatch.id}:wechat:group:${chatId}`;
-            activeBindings.set(chatId, {
-              agentId: bindMatch.id,
-              groupName: chatId,
-              sessionKey,
-              boundAt: Date.now(),
-            });
-
-            const name = bindMatch.mentionNames[0] ?? bindMatch.id;
-            log(`[wechat-buffer] Created binding: group="${chatId}" → agent="${bindMatch.id}" (session=${sessionKey})`);
-
-            // 构建历史上下文（包含当前绑定消息之前的消息）
-            const historyContext = formatBufferAsContext(chatId);
-
-            const messageCtx: WechatMessageContext = {
-              chatId,
-              messageId,
-              senderId: senderName,
-              senderName,
-              chatType,
-              content: actualContent,
-            };
-
-            // 发送绑定确认
-            await sendDirectMessage(`✅ ${name}已上线，开始关注本群消息。直接@${wechatCfg.botName ?? "扫拖一体🤖"}或提到我名字就行～`, chatId);
-
-            // 将绑定消息 + 历史上下文路由到 agent（wasMentioned=true 触发正常回复）
-            await handleWechatMessage({
-              cfg,
-              ctx: messageCtx,
-              runtimeEnv,
-              resolvedAgentId: bindMatch.id,
-              wasMentioned: true,
-              historyContext: historyContext || undefined,
-            });
-          }
-          return;
-        }
-
-        // ── 步骤 3：检测解绑关键词 ──
-        const unbindMatch = matchUnbindTrigger(actualContent, agentConfigs);
-        if (unbindMatch) {
-          log(`[wechat-buffer] 🔓 Unbind trigger detected for agent "${unbindMatch.id}" in group "${chatId}"`);
-          const binding = activeBindings.get(chatId);
-          const name = unbindMatch.mentionNames[0] ?? unbindMatch.id;
-
-          if (binding && binding.agentId === unbindMatch.id) {
-            // 先发确认
-            await sendDirectMessage(`👋 ${name}已下线，不再关注本群消息。`, chatId);
-            // 清绑定状态
-            activeBindings.delete(chatId);
-            log(`[wechat-buffer] Binding removed for group "${chatId}"`);
-            // 清 session queue
-            try {
-              const core = getWechatRuntime();
-              const { clearSessionQueues } = core.channel.reply;
-              if (typeof clearSessionQueues === "function") {
-                clearSessionQueues([binding.sessionKey]);
-                log(`[wechat-buffer] Session queue "${binding.sessionKey}" cleared`);
-              }
-            } catch (err) {
-              log(`[wechat-buffer] Session queue clear failed (non-critical): ${err}`);
-            }
-          } else {
-            await sendDirectMessage(`⚠️ ${name}当前未绑定到本群。`, chatId);
-          }
-          return;
-        }
-
-        // ── 步骤 4：已绑定群 → 路由到 agent ──
-        const binding = activeBindings.get(chatId);
-        if (binding) {
-          const messageCtx: WechatMessageContext = {
-            chatId,
-            messageId,
-            senderId: senderName,
-            senderName,
-            chatType,
-            content: actualContent,
-          };
-
-          await handleWechatMessage({
-            cfg,
-            ctx: messageCtx,
-            runtimeEnv,
-            resolvedAgentId: binding.agentId,
-            wasMentioned: false, // 触发检测在 handleWechatMessage 内部完成
-          });
-          return;
-        }
-
-        // ── 步骤 5：未绑定群 → 仅缓冲，零消耗 ──
-        log(`[wechat-buffer] Group "${chatId}" not bound, message buffered only (no model consumption)`);
+        await handleWechatMessage({ cfg, ctx: messageCtx, runtimeEnv });
       }
 
       // 启动通知监控
       await startNotificationMonitor(
         async (sender: string, content: string) => {
-          if (!isLikelyWechatGroupNotificationBody(content)) {
-            log(`[wechat-notify] Ignored non-WeChat-group notification: sender=${sender}, body=${content.slice(0, 50)}`);
-            return;
-          }
-
           // 发件人白名单过滤（allowedSenders 未配置时不过滤）
           const allowedSenders = (cfg as any)?.channels?.wechat?.allowedSenders as string[] | undefined;
           if (allowedSenders && allowedSenders.length > 0) {
