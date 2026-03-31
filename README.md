@@ -10,7 +10,7 @@ OpenClaw 的微信渠道插件 — macOS 原生方案，通过通知监控接收
 - **长文本补全**：通知被截断时，通过 Peekaboo 截屏 + OCR 恢复完整文本
 - **发送消息**：AppleScript + 剪贴板 + UI 自动化，支持搜索切换目标群
 - **群聊原生支持**：专为微信群聊设计，解析通知 body 中的 `发送者: 内容` 格式，自动识别群名和发送者，支持同时跟进多个群（每群独立 session）
-- **多 agent 绑定**：支持在不同群聊中绑定不同 agent（洛茜 / 汤汤等）
+- **多 agent 绑定**：支持在不同群聊中绑定不同 agent
 - **名字触发**：支持 @botName / 提及 agent 名字 / 自定义触发符，三种触发方式
 - **静默上下文**：绑定后 agent 接收群内所有消息作为上下文，仅被触发时才回复
 - **Prompt Injection 防护**：9 种注入模式正则前置拦截，命中直接回复不消耗模型
@@ -37,13 +37,13 @@ OpenClaw 的微信渠道插件 — macOS 原生方案，通过通知监控接收
       "blockStreaming": true,
       "groupOnly": true,
       "botName": "你的机器人名字",
-      "botTrigger": "＆洛茜",        // 全角 &，触发 agent 回复
-      "agent": "rossi",
-      "allowedGroups": ["群名称"],    // 白名单，留空则不过滤
-      "allowedSenders": [],           // 发送者白名单，留空则不过滤
+      "botTrigger": "＆机器人",        // 全角 &，触发 agent 回复
+      "agent": "your-agent-id",
+      "allowedGroups": ["群名称"],      // 白名单，留空则不过滤
+      "allowedSenders": [],             // 发送者白名单，留空则不过滤
       "rateLimitPerMinute": 20,
       "dailyTokenBudget": 50000,
-      "systemMessagePrefix": "OC_SYS_"  // 系统消息前缀，agent SOUL.md 中需同步配置
+      "systemMessagePrefix": "OC_SYS_" // 系统消息前缀，agent SOUL.md 中需同步配置
     }
   }
 }
@@ -59,16 +59,16 @@ OpenClaw 的微信渠道插件 — macOS 原生方案，通过通知监控接收
       "groupOnly": true,
       "agents": [
         {
-          "id": "rossi",
-          "bindTrigger": "&洛茜",      // 半角 &，绑定当前群
-          "unbindTrigger": "！洛茜",   // 全角 !，解绑 + 清 session
-          "mentionNames": ["洛茜", "rossi"]
+          "id": "agent-a",
+          "bindTrigger": "&机器人A",    // 半角 &，绑定当前群
+          "unbindTrigger": "！机器人A", // 全角 !，解绑 + 清 session
+          "mentionNames": ["机器人A", "agent-a"]
         },
         {
-          "id": "tangtang",
-          "bindTrigger": "&汤汤",
-          "unbindTrigger": "！汤汤",
-          "mentionNames": ["汤汤", "tangtang"]
+          "id": "agent-b",
+          "bindTrigger": "&机器人B",
+          "unbindTrigger": "！机器人B",
+          "mentionNames": ["机器人B", "agent-b"]
         }
       ]
     }
@@ -77,18 +77,18 @@ OpenClaw 的微信渠道插件 — macOS 原生方案，通过通知监控接收
 ```
 
 **绑定说明：**
-- 在目标群中发 `&洛茜` → 洛茜开始跟进该群（通知来源自动识别群名，无需微信停留在目标窗口）
-- 发 `！洛茜` → 停止跟进 + 清除 session
+- 在目标群中发 `&机器人A` → 该 agent 开始跟进此群（通知来源自动识别群名，无需微信停留在目标窗口）
+- 发 `！机器人A` → 停止跟进 + 清除 session
 - 绑定后群内所有消息作为静默上下文，只有被触发（@/名字/触发符）时才正式回复
 
 ## 消息链路
 
 ```
-群成员发 "洛茜 你好"
+群成员发 "@机器人 你好"
   → macOS 通知（需微信在后台）
   → AppleScript 轮询（0.5s）→ 解析群名/发送者/内容
   → allowedGroups 白名单 → 触发符/名字匹配 → 频率/额度检查
-  → dispatch 到 rossi（session=agent:rossi:wechat:group:群名）
+  → dispatch 到 agent（session=agent:<agentId>:wechat:group:<群名>）
   → 模型生成回复（~4s）
   → System Events 激活微信 → Cmd+F 搜索群 → 粘贴 + 发送 → 切后台
 端到端延迟：约 8 秒
@@ -108,7 +108,7 @@ OpenClaw 的微信渠道插件 — macOS 原生方案，通过通知监控接收
 
 - **通知截断**：macOS 通知最多约 65 字符；长文本通过 OCR 补全，OCR 失败时退回截断内容
 - **多媒体消息**：图片/语音/视频无法从通知恢复正文，当前跳过
-- **绑定不持久**：绑定状态存在内存中，gateway 重启后需重新绑定（`&洛茜`）
+- **绑定不持久**：绑定状态存在内存中，gateway 重启后需重新绑定
 - **前台占用**：发送时短暂激活微信窗口；剪贴板做 best-effort 文本恢复，非文本剪贴板可能被覆盖
 - **微信需在后台**：微信前台运行时不弹通知，会漏消息
 
@@ -136,5 +136,5 @@ openclaw-wechat-plugin/
 ## 路径
 
 - 插件目录：`~/.openclaw/workspace/plugins/openclaw-wechat-plugin/`
-- 触发符（默认）：`&洛茜` 绑定，`！洛茜` 解绑
+- 触发符示例：`&机器人` 绑定，`！机器人` 解绑（可自定义）
 - 系统消息前缀：`OC_SYS_`（需在 agent SOUL.md 中配置识别规则）
