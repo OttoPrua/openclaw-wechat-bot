@@ -14,6 +14,8 @@
   <img src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge" alt="License">
 </p>
 
+> 🤖 **Deploy with OpenClaw:** Tell your agent — *"Run the DEPLOY.md guide"* — and it will walk through installation interactively. → [DEPLOY.md](DEPLOY.md)
+
 An [OpenClaw](https://github.com/openclaw/openclaw) plugin that brings WeChat group chats into your agent stack. Receives messages via macOS Notification Center, sends via AppleScript UI automation. Supports multiple agents, name-based triggering, and prompt injection defense — no WeChat API or root access required.
 
 > **Status: ✅ Production** (macOS Tahoe + WeChat macOS)

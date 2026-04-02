@@ -14,6 +14,8 @@
   <img src="https://img.shields.io/badge/许可证-MIT-blue?style=for-the-badge" alt="License">
 </p>
 
+> 🤖 **让 OpenClaw 自动部署：** 告诉你的 agent — *「按照 DEPLOY.md 帮我部署」* — 它会交互式逐步完成安装。→ [DEPLOY.md](DEPLOY.md)
+
 [OpenClaw](https://github.com/openclaw/openclaw) 的微信渠道插件，将微信群聊接入你的 agent 体系。通过 macOS 通知中心接收消息，AppleScript UI 自动化发送消息。支持多 agent 绑定、名字触发和 Prompt Injection 防护，无需微信 API 或 root 权限。
 
 > **状态：✅ 生产就绪**（macOS Tahoe + 微信 macOS 版）
