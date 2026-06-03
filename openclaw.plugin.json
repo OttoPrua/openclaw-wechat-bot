@@ -7,5 +7,73 @@
     "type": "object",
     "additionalProperties": true,
     "properties": {}
+  },
+  "channelConfigs": {
+    "wechat": {
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "blockStreaming": { "type": "boolean" },
+          "groupOnly": { "type": "boolean" },
+          "botName": { "type": "string" },
+          "allowedSenders": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "allowedGroups": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "bindingsPath": { "type": "string" },
+          "sourceGate": {
+            "type": "string",
+            "enum": ["strict", "allow-missing-app-name"]
+          },
+          "ocrRecoveryMode": {
+            "type": "string",
+            "enum": ["off", "bound-only"]
+          },
+          "mentionOcrPreflight": {
+            "type": "string",
+            "enum": ["off", "bound-only"]
+          },
+          "ocrChatPanelLeftRatio": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 0.9
+          },
+          "ocrChatPanelLeftMaxPx": {
+            "type": "number",
+            "minimum": 120
+          },
+          "ocrChatPanelTopRatio": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 0.9
+          },
+          "ocrChatPanelBottomRatio": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 0.9
+          },
+          "ocrTotalTimeoutMs": { "type": "number" },
+          "rateLimitPerMinute": { "type": "number" },
+          "dailyTokenBudget": { "type": "number" },
+          "agent": { "type": "string" },
+          "agents": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "label": "WeChat",
+      "description": "WeChat intake through macOS notifications and AppleScript sending."
+    }
   }
 }

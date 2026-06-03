@@ -1,4 +1,4 @@
-import { existsSync, statSync, readdirSync } from "node:fs";
+import { existsSync, statSync, readdirSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
 import { dirname, basename, join } from "node:path";
 import { exec as execCallback, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
@@ -11,10 +11,34 @@ import type {
 } from "openclaw/plugin-sdk";
 import {
   DEFAULT_ACCOUNT_ID,
-  emptyPluginConfigSchema,
+} from "openclaw/plugin-sdk/account-id";
+import {
   createReplyPrefixContext,
   createTypingCallbacks,
-} from "openclaw/plugin-sdk";
+} from "openclaw/plugin-sdk/channel-reply-pipeline";
+import {
+  emptyPluginConfigSchema,
+} from "openclaw/plugin-sdk/core";
+import {
+  ARCHIVED_ROSSI_NOTICE,
+  appendBoundedBufferMessage,
+  buildAgentSessionKey,
+  DEFAULT_MESSAGE_BUFFER_MAX,
+  detectWechatAgentMention,
+  listWechatAllowedGroupEntries,
+  getWechatAgentConfigs,
+  isAllowedGroup,
+  isDuplicateMessage,
+  isLikelyWechatGroupNotification,
+  matchBindTrigger,
+  matchLegacyRossiTrigger,
+  matchUnbindTrigger,
+  normalizeWechatOutboundTarget,
+  parseWechatAtMentionNotification,
+  resolveWechatAllowedGroupTarget,
+  type DedupeState,
+  type WechatAgentConfig,
+} from "./src/wechat-core.ts";
 
 const exec = promisify(execCallback);
 
@@ -147,7 +171,7 @@ let activeAgentId: string = "";
 // 消息缓冲层（零模型消耗）
 // ============================================================
 
-const MESSAGE_BUFFER_MAX = 10; // 每个群最多保留的消息条数
+const MESSAGE_BUFFER_MAX = DEFAULT_MESSAGE_BUFFER_MAX; // 每个群最多保留的消息条数
 
 type BufferedMessage = {
   sender: string;
@@ -161,10 +185,12 @@ type GroupBuffer = {
 };
 
 type ActiveBinding = {
-  agentId: string;       // "rossi" | "tangtang"
+  agentId: string;       // "tomimi" | "tangtang"
   groupName: string;
   sessionKey: string;
   boundAt: number;
+  updatedAt?: number;
+  source?: "user-trigger";
 };
 
 // Map<groupName, GroupBuffer>
@@ -177,10 +203,11 @@ function addToBuffer(groupName: string, sender: string, content: string): void {
     messageBuffers.set(groupName, { groupName, messages: [] });
   }
   const buf = messageBuffers.get(groupName)!;
-  buf.messages.push({ sender, content, timestamp: Date.now() });
-  if (buf.messages.length > MESSAGE_BUFFER_MAX) {
-    buf.messages.shift(); // FIFO：移除最旧的消息
-  }
+  buf.messages = appendBoundedBufferMessage(
+    buf.messages,
+    { sender, content, timestamp: Date.now() },
+    MESSAGE_BUFFER_MAX,
+  );
 }
 
 function formatBufferAsContext(groupName: string): string {
@@ -193,66 +220,12 @@ function formatBufferAsContext(groupName: string): string {
   return `[微信群近期消息 - 群名: ${groupName}]\n${lines.join("\n")}\n[以上为历史消息，请从最新消息开始回复]`;
 }
 
-// 规范化全角/半角符号（& ＆ 和 ! ！）用于关键词匹配
-function normalizeSymbols(text: string): string {
-  return text.replace(/＆/g, "&").replace(/!/g, "！");
-}
-
-// 检查是否包含绑定关键词，返回匹配的 agentConfig 或 null
-function matchBindTrigger(content: string, agentConfigs: WechatAgentConfig[]): WechatAgentConfig | null {
-  const normalized = normalizeSymbols(content.trim());
-  for (const ac of agentConfigs) {
-    const triggerNorm = normalizeSymbols(ac.bindTrigger);
-    if (normalized.includes(triggerNorm)) return ac;
-  }
-  return null;
-}
-
-// 检查是否包含解绑关键词，返回匹配的 agentConfig 或 null
-function matchUnbindTrigger(content: string, agentConfigs: WechatAgentConfig[]): WechatAgentConfig | null {
-  const normalized = normalizeSymbols(content.trim());
-  for (const ac of agentConfigs) {
-    const triggerNorm = normalizeSymbols(ac.unbindTrigger);
-    if (normalized.includes(triggerNorm)) return ac;
-  }
-  return null;
-}
-
-// Multi-agent config type
-type WechatAgentConfig = {
-  id: string;
-  bindTrigger: string;   // e.g. "&洛茜" — 半角 & 开始跟进
-  unbindTrigger: string;  // e.g. "！洛茜" — 全角 ! 停止跟进并清 session
-  mentionNames: string[];
-};
-
-// 从配置中读取多 agent 配置，支持向后兼容
-function getWechatAgentConfigs(wechatCfg: any): WechatAgentConfig[] {
-  if (Array.isArray(wechatCfg.agents) && wechatCfg.agents.length > 0) {
-    return wechatCfg.agents.map((a: any) => ({
-      ...a,
-      unbindTrigger: a.unbindTrigger ?? a.bindTrigger?.replace(/^&/, "！") ?? `！${a.mentionNames?.[0] ?? ""}`,
-    }));
-  }
-  // 向后兼容：旧版单 agent 配置
-  const agentId = wechatCfg.agent ?? "rossi";
-  const oldTrigger = wechatCfg.botTrigger ?? "＆洛茜";
-  const nameFromTrigger = oldTrigger.replace(/[＆&]/g, "");
-  return [{
-    id: agentId,
-    bindTrigger: `&${nameFromTrigger}`,
-    unbindTrigger: `！${nameFromTrigger}`,
-    mentionNames: [nameFromTrigger],
-  }];
-}
-
 // 系统消息前缀：用于区分「静默处理的系统/上下文消息」和「需要正常回复的用户消息」
 // 可在 channels.wechat.systemMessagePrefix 中覆盖，默认使用固定 UUID 前缀方便跨 agent 共享
 const DEFAULT_SYSTEM_MESSAGE_PREFIX = "OC_SYS_6c7c0f8d-4d27-4d3d-9d93-c7c9d4b8d11a";
 
 // 消息去重：存储已处理的消息 key（发送者 + 内容前20字符）
-const processedMessages = new Set<string>();
-const MAX_PROCESSED_MESSAGES = 1000;
+const processedMessages: DedupeState = new Map();
 
 // ============================================================
 // 频率限制 & Token 预算
@@ -321,24 +294,6 @@ function recordMessageSent(): void {
   messageTimestamps.push(Date.now());
 }
 
-// 生成消息去重 key
-function getMessageKey(sender: string, content: string): string {
-  const contentPrefix = content.slice(0, 20);
-  return `${sender}:::${contentPrefix}`;
-}
-
-function markMessageProcessed(sender: string, content: string): void {
-  const key = getMessageKey(sender, content);
-  
-  // 清理旧记录，避免内存无限增长
-  if (processedMessages.size >= MAX_PROCESSED_MESSAGES) {
-    const toDelete = Array.from(processedMessages).slice(0, 200);
-    toDelete.forEach((k) => processedMessages.delete(k));
-  }
-  
-  processedMessages.add(key);
-}
-
 // 判断是否是多媒体消息
 function isMediaMessage(content: string): boolean {
   return /^\[(图片|视频|文件|语音)\]/.test(content);
@@ -347,13 +302,40 @@ function isMediaMessage(content: string): boolean {
 // 判断消息是否需要 OCR 补全（长文本）
 const NOTIFICATION_MAX_LENGTH = 60; // 通知最大显示约 65 字符，留点余量
 const OCR_SCREENSHOT_TIMEOUT_MS = 2000;
-const OCR_RECOGNITION_TIMEOUT_MS = 3000;
+const OCR_RECOGNITION_TIMEOUT_MS = 7000;
 const OCR_TOTAL_TIMEOUT_MS = 5000;
 const OCR_PREFIX_LENGTH = 55;
 const OCR_SCREENSHOT_BIN = "/opt/homebrew/bin/peekaboo";
-const OCR_WECHAT_APP_NAME = "微信";
+const OCR_WECHAT_APP_NAMES = ["微信", "WeChat"];
 const OCR_BINARY_PATH = `${process.env.HOME ?? ""}/.openclaw/workspace/bin/wechat-ocr`;
+const OCR_SWIFT_SOURCE_PATH = `${process.env.HOME ?? ""}/.openclaw/workspace/bin/wechat-ocr.swift`;
+const OCR_SCREENSHOT_DIR = `${process.env.HOME ?? ""}/.openclaw/tmp/wechat-ocr`;
 const OCR_MESSAGE_SEPARATOR_RE = /^(?:\d{1,2}:\d{2}|昨天|星期[一二三四五六日天]|周[一二三四五六日天]|上午|下午|晚上|凌晨|中午|[a-zA-Z0-9_-]{6,}|.+(?:群聊|服务通知|文件传输助手))$/;
+const OCR_CONTEXT_MAX_CHARS = 2200;
+const OCR_CONTEXT_MAX_LINES = 24;
+const OCR_CHAT_PANEL_LEFT_RATIO = 0.34;
+const OCR_CHAT_PANEL_LEFT_MAX_PX = 420;
+const OCR_CHAT_PANEL_TOP_RATIO = 0.05;
+const OCR_CHAT_PANEL_BOTTOM_RATIO = 0.08;
+const OCR_FAILURE_NOTICE = "⚠️ 已收到@，但 OpenClaw OCR 前置暂时无法读取微信窗口正文；请检查屏幕录制权限后再试。";
+
+type OcrCropRect = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+};
+
+type ImageDimensions = {
+  width: number;
+  height: number;
+};
+
+function getMentionOcrPreflightMode(wechatCfg: any): "off" | "bound-only" {
+  const configured = wechatCfg?.mentionOcrPreflight ?? wechatCfg?.ocrOnMention;
+  if (configured === "off" || configured === false) return "off";
+  return "bound-only";
+}
 
 function needsNotificationRecovery(content: string): boolean {
   if (isMediaMessage(content)) {
@@ -367,6 +349,114 @@ function needsNotificationRecovery(content: string): boolean {
 
 function shellEscape(value: string): string {
   return `'${value.replace(/'/g, `'\''`)}'`;
+}
+
+function describeExecError(err: unknown): string {
+  const anyErr = err as { message?: unknown; stderr?: unknown; stdout?: unknown; code?: unknown };
+  const parts = [String(anyErr?.message ?? err)];
+  const stderr = String(anyErr?.stderr ?? "").trim();
+  const stdout = String(anyErr?.stdout ?? "").trim();
+  if (stderr) parts.push(`stderr=${stderr}`);
+  if (stdout) parts.push(`stdout=${stdout}`);
+  if (anyErr?.code !== undefined) parts.push(`code=${String(anyErr.code)}`);
+  return parts.join(" | ");
+}
+
+function clampRatio(value: unknown, fallback: number): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(0.9, Math.max(0, numeric));
+}
+
+function clampPositiveNumber(value: unknown, fallback: number): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return fallback;
+  return numeric;
+}
+
+async function readImageDimensions(imagePath: string, log: (...args: any[]) => void): Promise<ImageDimensions | null> {
+  try {
+    const { stdout } = await execWithUtf8(`sips -g pixelWidth -g pixelHeight ${shellEscape(imagePath)}`, {
+      timeout: 1000,
+    });
+    const width = Number(stdout.match(/pixelWidth:\s*(\d+)/)?.[1]);
+    const height = Number(stdout.match(/pixelHeight:\s*(\d+)/)?.[1]);
+    if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+      return { width, height };
+    }
+  } catch (err) {
+    log(`[wechat-ocr] Failed to read screenshot dimensions: ${describeExecError(err)}`);
+  }
+  return null;
+}
+
+function buildChatPanelCrop(dimensions: ImageDimensions, wechatCfg: any = {}): OcrCropRect {
+  const leftRatio = clampRatio(wechatCfg?.ocrChatPanelLeftRatio, OCR_CHAT_PANEL_LEFT_RATIO);
+  const leftMaxPx = clampPositiveNumber(wechatCfg?.ocrChatPanelLeftMaxPx, OCR_CHAT_PANEL_LEFT_MAX_PX);
+  const topRatio = clampRatio(wechatCfg?.ocrChatPanelTopRatio, OCR_CHAT_PANEL_TOP_RATIO);
+  const bottomRatio = clampRatio(wechatCfg?.ocrChatPanelBottomRatio, OCR_CHAT_PANEL_BOTTOM_RATIO);
+
+  const rawX = Math.floor(dimensions.width * leftRatio);
+  const x = Math.min(Math.max(0, rawX), leftMaxPx, Math.max(0, dimensions.width - 120));
+  const y = Math.min(Math.max(0, Math.floor(dimensions.height * topRatio)), Math.max(0, dimensions.height - 120));
+  const bottom = Math.floor(dimensions.height * bottomRatio);
+  const w = Math.max(120, dimensions.width - x);
+  const h = Math.max(120, dimensions.height - y - bottom);
+
+  return {
+    x,
+    y,
+    w: Math.min(w, dimensions.width - x),
+    h: Math.min(h, dimensions.height - y),
+  };
+}
+
+async function runWechatOcr(
+  screenshotPath: string,
+  wechatCfg: any,
+  log: (...args: any[]) => void,
+): Promise<string> {
+  const dimensions = await readImageDimensions(screenshotPath, log);
+  const crop = dimensions ? buildChatPanelCrop(dimensions, wechatCfg) : null;
+  const cropArgs = crop ? ` ${crop.x} ${crop.y} ${crop.w} ${crop.h}` : "";
+  if (crop) {
+    log(`[wechat-ocr] Running right-panel OCR crop x=${crop.x}, y=${crop.y}, w=${crop.w}, h=${crop.h}`);
+  } else {
+    log(`[wechat-ocr] Running OCR without crop because screenshot dimensions are unavailable`);
+  }
+
+  const useSwiftSource = existsSync(OCR_SWIFT_SOURCE_PATH);
+  if (!useSwiftSource && !existsSync(OCR_BINARY_PATH)) {
+    throw new Error(`OCR runtime not found: ${OCR_SWIFT_SOURCE_PATH} or ${OCR_BINARY_PATH}`);
+  }
+  const command = useSwiftSource
+    ? `/usr/bin/swift ${shellEscape(OCR_SWIFT_SOURCE_PATH)} ${shellEscape(screenshotPath)}${cropArgs}`
+    : `${shellEscape(OCR_BINARY_PATH)} ${shellEscape(screenshotPath)}${cropArgs}`;
+  const { stdout } = await execWithUtf8(command, {
+    timeout: OCR_RECOGNITION_TIMEOUT_MS,
+    maxBuffer: 1024 * 1024,
+  });
+  return stdout;
+}
+
+async function captureWeChatScreenshot(screenshotPath: string, log: (...args: any[]) => void): Promise<boolean> {
+  const screenshotBin = existsSync(OCR_SCREENSHOT_BIN) ? OCR_SCREENSHOT_BIN : "peekaboo";
+  let lastError = "";
+
+  for (const appName of OCR_WECHAT_APP_NAMES) {
+    try {
+      const screenshotCmd = `${screenshotBin} image --app ${shellEscape(appName)} --path ${shellEscape(screenshotPath)}`;
+      await execWithUtf8(screenshotCmd, { timeout: OCR_SCREENSHOT_TIMEOUT_MS });
+      if (existsSync(screenshotPath)) return true;
+      lastError = `screenshot command for ${appName} completed but did not create ${screenshotPath}`;
+    } catch (err) {
+      lastError = describeExecError(err);
+      log(`[wechat-ocr] Screenshot failed with app name "${appName}": ${lastError}`);
+    }
+  }
+
+  log(`[wechat-ocr] Screenshot failed for all WeChat app names: ${lastError}`);
+  return false;
 }
 
 function normalizeOcrLine(line: string): string {
@@ -389,6 +479,21 @@ function normalizeOcrLine(line: string): string {
     .replace(/[—–]/g, "-")
     .replace(/[……]/g, "...")
     .trim();
+}
+
+function buildOcrBotAliases(botName: string): string[] {
+  const aliases = new Set<string>();
+  const normalizedBotName = normalizeOcrLine(botName);
+  if (normalizedBotName) aliases.add(normalizedBotName);
+
+  const strippedBotName = normalizedBotName.replace(/[^\p{L}\p{N}]+/gu, "");
+  if (strippedBotName) aliases.add(strippedBotName);
+
+  // macOS Vision often drops or mutates the trailing emoji in "@扫拖一体🤖".
+  // Keep this alias narrow so unrelated messages do not become bot mentions.
+  if (strippedBotName.includes("扫拖一体")) aliases.add("扫拖一体");
+
+  return Array.from(aliases).filter((alias) => alias.length >= 3);
 }
 
 function buildOcrPrefixes(rawContent: string): string[] {
@@ -456,7 +561,7 @@ function extractFullContentFromOcr(ocrText: string, notificationContent: string,
       const index = joined.indexOf(prefix);
       if (index >= 0) {
         log(`[wechat-ocr] Prefix matched in joined OCR text for ${sender}, but could not isolate message bubble`);
-        return lines.join("\n");
+        return null;
       }
     }
     return null;
@@ -467,28 +572,163 @@ function extractFullContentFromOcr(ocrText: string, notificationContent: string,
   return content;
 }
 
-async function enrichNotificationWithOcr(sender: string, content: string, log: (...args: any[]) => void): Promise<string> {
+function extractAtMentionContentFromOcr(ocrText: string, mentionSenderName: string, botName: string, log: (...args: any[]) => void): string | null {
+  const lines = ocrText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return null;
+
+  const normalizedLines = lines.map((line) => normalizeOcrLine(line));
+  const normalizedBotAliases = buildOcrBotAliases(botName);
+  const normalizedMentionSender = normalizeOcrLine(mentionSenderName);
+  let best: { start: number; end: number; content: string } | null = null;
+
+  for (let start = 0; start < lines.length; start += 1) {
+    const normalizedLine = normalizedLines[start];
+    if (!normalizedBotAliases.some((alias) => normalizedLine.includes(alias))) continue;
+
+    let end = start;
+    for (let next = start + 1; next < Math.min(lines.length, start + 6); next += 1) {
+      const currentLine = lines[next].trim();
+      const normalizedCurrent = normalizedLines[next];
+      if (OCR_MESSAGE_SEPARATOR_RE.test(currentLine)) break;
+      if (normalizedCurrent === normalizedMentionSender) break;
+      end = next;
+    }
+
+    let contentLines = lines.slice(start, end + 1);
+    if (contentLines.length > 1 && normalizeOcrLine(contentLines[0]) === normalizedMentionSender) {
+      contentLines = contentLines.slice(1);
+    }
+    const content = contentLines.join("\n").trim();
+    if (content) best = { start, end, content };
+  }
+
+  if (!best) return null;
+  log(`[wechat-ocr] Matched @mention OCR message from ${mentionSenderName} at lines ${best.start + 1}-${best.end + 1}`);
+  return best.content;
+}
+
+function isLikelyOcrUiNoise(line: string): boolean {
+  const normalized = normalizeOcrLine(line);
+  if (!normalized) return true;
+  if (normalized.length <= 1) return true;
+  if (/^(Q?搜索|\+|十|公众号|服务通知|微信支付|群聊)$/.test(normalized)) return true;
+  if (/^\[?\d+条\]?/.test(normalized)) return true;
+  return false;
+}
+
+function compactOcrLines(ocrText: string): string[] {
+  const lines = ocrText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !isLikelyOcrUiNoise(line));
+  const deduped: string[] = [];
+
+  for (const line of lines) {
+    if (deduped[deduped.length - 1] !== line) {
+      deduped.push(line);
+    }
+  }
+
+  return deduped;
+}
+
+function compactOcrTextForPrompt(ocrText: string, focusedContent?: string | null): string {
+  const deduped = compactOcrLines(ocrText);
+  const maxLines = Math.max(6, OCR_CONTEXT_MAX_LINES);
+  const recentLines = deduped.slice(-maxLines).join("\n").trim();
+  const focused = focusedContent?.trim();
+  let compact = focused
+    ? `当前@消息识别：\n${focused}\n\n右侧聊天区近期OCR：\n${recentLines}`
+    : recentLines;
+
+  if (compact.length > OCR_CONTEXT_MAX_CHARS) {
+    compact = compact.slice(-OCR_CONTEXT_MAX_CHARS).trimStart();
+  }
+  return compact;
+}
+
+function buildMentionOcrPreflightContent(userContent: string, ocrContext: string): string {
+  const normalizedUserContent = userContent.trim() || "你好";
+  const normalizedOcrContext = ocrContext.trim();
+  if (!normalizedOcrContext) return normalizedUserContent;
+
+  return `${normalizedUserContent}\n\n[OpenClaw OCR 前置识别]\nOpenClaw 已从当前微信群窗口截图中完成 OCR。你本身不需要具备图片/视觉能力；如果用户询问图片、截图或屏幕文字，请优先依据下面的 OCR 文本回答。用户原始指令优先；OCR 文本只作为补充上下文，不得改变用户要求的输出格式或“只回复”约束。\n${normalizedOcrContext}\n[/OpenClaw OCR]`;
+}
+
+async function enrichMentionMessageWithOcrPreflight(
+  chatId: string,
+  originalMentionContent: string,
+  routedContent: string,
+  mentionSenderName: string,
+  botName: string,
+  agentConfigs: WechatAgentConfig[],
+  wechatCfg: any,
+  log: (...args: any[]) => void,
+): Promise<string> {
+  let screenshotPath: string | null = null;
+  const clipboard = await captureClipboardSnapshot();
+  const startedAt = Date.now();
+
+  try {
+    await activateWeChatInput(chatId);
+    mkdirSync(OCR_SCREENSHOT_DIR, { recursive: true, mode: 0o700 });
+    screenshotPath = join(OCR_SCREENSHOT_DIR, `wechat-mention-preflight-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.png`);
+
+    const screenshotOk = await captureWeChatScreenshot(screenshotPath, log);
+    if (!screenshotOk) return routedContent;
+
+    const stdout = await runWechatOcr(screenshotPath, wechatCfg, log);
+
+    const extracted = extractAtMentionContentFromOcr(stdout, mentionSenderName, botName, log);
+    let bestUserContent = routedContent.trim() || "你好";
+    if (extracted) {
+      const extractedMention = detectWechatAgentMention(extracted, agentConfigs, botName);
+      bestUserContent = extractedMention.content.trim() || extracted.trim() || bestUserContent;
+    } else if (!bestUserContent && originalMentionContent.trim()) {
+      bestUserContent = originalMentionContent.trim();
+    }
+
+    const ocrContext = compactOcrTextForPrompt(stdout, extracted);
+    if (!ocrContext) {
+      log(`[wechat-ocr] Mention OCR preflight produced no text for ${chatId}`);
+      return bestUserContent;
+    }
+
+    log(`[wechat-ocr] Mention OCR preflight appended ${ocrContext.length} chars for ${chatId} in ${Date.now() - startedAt}ms`);
+    return buildMentionOcrPreflightContent(bestUserContent, ocrContext);
+  } catch (err) {
+    log(`[wechat-ocr] Mention OCR preflight failed for ${chatId}: ${describeExecError(err)}`);
+    return routedContent;
+  } finally {
+    if (screenshotPath) {
+      try {
+        unlinkSync(screenshotPath);
+      } catch {
+        // ignore cleanup failure
+      }
+    }
+    await restoreClipboardSnapshot(clipboard);
+  }
+}
+
+async function enrichNotificationWithOcr(sender: string, content: string, wechatCfg: any, log: (...args: any[]) => void): Promise<string> {
   if (!needsNotificationRecovery(content) || isMediaMessage(content)) {
     return content;
   }
 
-  const screenshotPath = `/tmp/wechat-ocr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.png`;
-  const screenshotBin = existsSync(OCR_SCREENSHOT_BIN) ? OCR_SCREENSHOT_BIN : "peekaboo";
+  mkdirSync(OCR_SCREENSHOT_DIR, { recursive: true, mode: 0o700 });
+  const screenshotPath = join(OCR_SCREENSHOT_DIR, `wechat-ocr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.png`);
   const startedAt = Date.now();
 
   try {
-    const screenshotCmd = `${screenshotBin} image --app ${shellEscape(OCR_WECHAT_APP_NAME)} --path ${shellEscape(screenshotPath)}`;
-    await execWithUtf8(screenshotCmd, { timeout: OCR_SCREENSHOT_TIMEOUT_MS });
+    await activateWeChatInput(sender);
+    const screenshotOk = await captureWeChatScreenshot(screenshotPath, log);
+    if (!screenshotOk) return content;
 
-    if (!existsSync(OCR_BINARY_PATH)) {
-      log(`[wechat-ocr] OCR binary not found: ${OCR_BINARY_PATH}`);
-      return content;
-    }
-
-    const { stdout } = await execWithUtf8(`${shellEscape(OCR_BINARY_PATH)} ${shellEscape(screenshotPath)}`, {
-      timeout: OCR_RECOGNITION_TIMEOUT_MS,
-      maxBuffer: 1024 * 1024,
-    });
+    const stdout = await runWechatOcr(screenshotPath, wechatCfg, log);
 
     const extracted = extractFullContentFromOcr(stdout, content, sender, log);
     if (!extracted) {
@@ -506,14 +746,57 @@ async function enrichNotificationWithOcr(sender: string, content: string, log: (
     log(`[wechat-ocr] Replaced truncated notification for ${sender} in ${Date.now() - startedAt}ms`);
     return extracted;
   } catch (err) {
-    log(`[wechat-ocr] OCR fallback failed for ${sender}: ${String(err)}`);
+    log(`[wechat-ocr] OCR fallback failed for ${sender}: ${describeExecError(err)}`);
     return content;
   } finally {
     try {
-      await execWithUtf8(`rm -f ${shellEscape(screenshotPath)}`);
+      unlinkSync(screenshotPath);
     } catch {
       // ignore cleanup failure
     }
+  }
+}
+
+async function enrichAtMentionNotificationWithOcr(
+  chatId: string,
+  notificationContent: string,
+  mentionSenderName: string,
+  botName: string,
+  wechatCfg: any,
+  log: (...args: any[]) => void,
+): Promise<string> {
+  let screenshotPath: string | null = null;
+  const clipboard = await captureClipboardSnapshot();
+
+  try {
+    await activateWeChatInput(chatId);
+    mkdirSync(OCR_SCREENSHOT_DIR, { recursive: true, mode: 0o700 });
+    screenshotPath = join(OCR_SCREENSHOT_DIR, `wechat-mention-ocr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.png`);
+
+    const screenshotOk = await captureWeChatScreenshot(screenshotPath, log);
+    if (!screenshotOk) return notificationContent;
+
+    const stdout = await runWechatOcr(screenshotPath, wechatCfg, log);
+
+    const extracted = extractAtMentionContentFromOcr(stdout, mentionSenderName, botName, log);
+    if (!extracted) {
+      log(`[wechat-ocr] No @mention OCR match for ${chatId}, using notification fallback`);
+      return notificationContent;
+    }
+
+    return `${mentionSenderName}: ${extracted}`;
+  } catch (err) {
+    log(`[wechat-ocr] @mention OCR fallback failed for ${chatId}: ${describeExecError(err)}`);
+    return notificationContent;
+  } finally {
+    if (screenshotPath) {
+      try {
+        unlinkSync(screenshotPath);
+      } catch {
+        // ignore cleanup failure
+      }
+    }
+    await restoreClipboardSnapshot(clipboard);
   }
 }
 
@@ -522,58 +805,117 @@ let notificationMonitorProcess: ChildProcess | null = null;
 
 // 启动通知监控（使用 AppleScript 读取 NotificationCenter UI）
 async function startNotificationMonitor(
-  onNotification: (sender: string, content: string) => void,
+  onNotification: (sender: string, content: string, appName?: string) => void,
   log: (...args: any[]) => void
 ): Promise<void> {
   log(`[wechat-notify] Starting notification monitor...`);
 
-  // AppleScript 脚本：持续监控 NotificationCenter 窗口
-  // macOS Tahoe 通知 UI 结构:
-  // window "Notification Center" > group 1 > group 1 > scroll area 1 > group 1 > group N > {static text 1 (sender), static text 2 (body)}
+  // AppleScript 脚本：持续监控通知列表和右上角横幅。
+  // NotificationCenter exposes historical/list notifications, while live banners
+  // are commonly owned by UserNotificationCenter on recent macOS builds.
   const appleScript = `
+    on appendTextValue(textList, rawValue)
+      try
+        set textValue to rawValue as text
+        if textValue is not "" then
+          set end of textList to textValue
+        end if
+      end try
+      return textList
+    end appendTextValue
+
+    on collectStaticTexts(uiNode, textList)
+      tell application "System Events"
+        try
+          set staticValues to value of every static text of uiNode
+          repeat with staticValue in staticValues
+            set textList to my appendTextValue(textList, staticValue)
+          end repeat
+        end try
+
+        try
+          set childNodes to every UI element of uiNode
+          repeat with childNode in childNodes
+            set textList to my collectStaticTexts(childNode, textList)
+          end repeat
+        end try
+      end tell
+
+      return textList
+    end collectStaticTexts
+
+    on emitNotificationFromTexts(allTexts, sourceName, lastMessages)
+      if (count of allTexts) < 2 then return lastMessages
+
+      set senderText to ""
+      set bodyText to ""
+      set appNameText to ""
+      set textCount to count of allTexts
+
+      repeat with textIndex from 1 to textCount
+        set currentText to item textIndex of allTexts as text
+        if currentText is "微信" or currentText is "WeChat" then
+          set appNameText to currentText
+          if (textIndex + 2) <= textCount then
+            set senderText to item (textIndex + 1) of allTexts as text
+            set bodyText to item (textIndex + 2) of allTexts as text
+            exit repeat
+          end if
+        end if
+      end repeat
+
+      if senderText is "" or bodyText is "" then
+        set senderText to item 1 of allTexts as text
+        set bodyText to item 2 of allTexts as text
+        if (count of allTexts) >= 3 then
+          repeat with textValue in allTexts
+            if (textValue as text) is "微信" or (textValue as text) is "WeChat" then
+              set appNameText to textValue as text
+            end if
+          end repeat
+        end if
+      end if
+
+      if senderText is appNameText and textCount >= 3 then
+        set senderText to item 2 of allTexts as text
+        set bodyText to item 3 of allTexts as text
+      end if
+
+      if senderText is not "" and bodyText is not "" then
+        set msgKey to sourceName & "|||" & senderText & "|||" & bodyText
+        if msgKey is not in lastMessages then
+          set end of lastMessages to msgKey
+          if (count of lastMessages) > 100 then
+            set lastMessages to items 51 thru -1 of lastMessages
+          end if
+          log "NOTIFICATION:" & senderText & "|||" & bodyText & "|||" & appNameText
+        end if
+      end if
+
+      return lastMessages
+    end emitNotificationFromTexts
+
+    on scanNotificationProcess(processName, lastMessages)
+      tell application "System Events"
+        if exists process processName then
+          tell process processName
+            repeat with uiWindow in every window
+              set allTexts to {}
+              set allTexts to my collectStaticTexts(uiWindow, allTexts)
+              set lastMessages to my emitNotificationFromTexts(allTexts, processName, lastMessages)
+            end repeat
+          end tell
+        end if
+      end tell
+      return lastMessages
+    end scanNotificationProcess
+
     on run
       set lastMessages to {}
       repeat
         try
-          tell application "System Events"
-            tell process "NotificationCenter"
-              if exists window "Notification Center" then
-                tell window "Notification Center"
-                  tell group 1
-                    tell group 1
-                      if exists scroll area 1 then
-                        tell scroll area 1
-                          tell group 1
-                            set notifGroups to every group
-                            repeat with notifGroup in notifGroups
-                              try
-                                set allTexts to value of every static text of notifGroup
-                                if (count of allTexts) >= 2 then
-                                  set senderText to item 1 of allTexts as text
-                                  set bodyText to item 2 of allTexts as text
-                                  if senderText is not "" and bodyText is not "" then
-                                    set msgKey to senderText & "|||" & bodyText
-                                    if msgKey is not in lastMessages then
-                                      set end of lastMessages to msgKey
-                                      -- Keep lastMessages from growing too large
-                                      if (count of lastMessages) > 50 then
-                                        set lastMessages to items 26 thru -1 of lastMessages
-                                      end if
-                                      log "NOTIFICATION:" & senderText & "|||" & bodyText
-                                    end if
-                                  end if
-                                end if
-                              end try
-                            end repeat
-                          end tell
-                        end tell
-                      end if
-                    end tell
-                  end tell
-                end tell
-              end if
-            end tell
-          end tell
+          set lastMessages to my scanNotificationProcess("UserNotificationCenter", lastMessages)
+          set lastMessages to my scanNotificationProcess("NotificationCenter", lastMessages)
         end try
         delay 0.5
       end repeat
@@ -590,11 +932,13 @@ async function startNotificationMonitor(
     if (output.startsWith("NOTIFICATION:")) {
       const content = output.replace("NOTIFICATION:", "");
       const parts = content.split("|||");
-      if (parts.length === 2) {
-        const [sender, body] = parts;
+      if (parts.length >= 2) {
+        const [sender, body, appName] = parts;
         log(`[wechat-notify] Received notification - sender: ${sender}, body: ${body.slice(0, 30)}...`);
-        onNotification(sender, body);
+        onNotification(sender, body, appName || undefined);
       }
+    } else if (output) {
+      log(`[wechat-notify] Monitor stderr: ${output}`);
     }
   });
 
@@ -613,36 +957,6 @@ function stopNotificationMonitor(): void {
     notificationMonitorProcess.kill();
     notificationMonitorProcess = null;
   }
-}
-
-function isLikelyWechatGroupNotificationBody(content: string): boolean {
-  const normalized = content.trim();
-  if (!normalized) return false;
-
-  if (/^.+?在群聊中@了你$/.test(normalized)) {
-    return true;
-  }
-
-  const groupMessageMatch = normalized.match(/^(.+?)[:：]\s*(.+)$/s);
-  if (!groupMessageMatch) {
-    return false;
-  }
-
-  const senderName = groupMessageMatch[1]?.trim();
-  const messageBody = groupMessageMatch[2]?.trim();
-
-  if (!senderName || !messageBody) {
-    return false;
-  }
-
-  // 仅过滤明显的系统通知（如 "Mail: You have 3 new messages"）
-  // 保留所有可能的微信群消息，包括纯英文用户名+非中文内容（如表情、省略号）
-  const systemAppPattern = /^(Mail|Calendar|Messages|Reminders|FaceTime|Slack|Discord|Telegram|WhatsApp|Signal|Teams|Zoom|Outlook|Gmail|Chrome|Safari|Firefox|Arc|Notion|Linear|GitHub|VS Code|Xcode|Terminal|iTerm2|Finder|TED Talks Daily)$/i;
-  if (systemAppPattern.test(senderName)) {
-    return false;
-  }
-
-  return true;
 }
 
 function getSystemMessagePrefix(cfg: any): string {
@@ -665,6 +979,114 @@ function getWechatRuntime(): PluginRuntime {
     throw new Error("WeChat runtime not initialized");
   }
   return runtime;
+}
+
+type PersistedBindingRecord = {
+  schemaVersion: 1;
+  channel: "wechat";
+  accountId: string;
+  groupName: string;
+  groupNameNormalized: string;
+  agentId: string;
+  sessionKey: string;
+  boundAt: number;
+  updatedAt: number;
+  source: "user-trigger";
+};
+
+type PersistedBindingFile = {
+  schemaVersion: 1;
+  bindings: PersistedBindingRecord[];
+};
+
+function normalizeGroupName(groupName: string): string {
+  return groupName.trim();
+}
+
+function resolveBindingsPath(cfg: any): string {
+  const configured = cfg?.channels?.wechat?.bindingsPath;
+  const rawPath = typeof configured === "string" && configured.trim()
+    ? configured.trim()
+    : `${process.env.HOME ?? ""}/.openclaw/state/wechat-bindings.json`;
+  if (rawPath.startsWith("~/")) {
+    return join(process.env.HOME ?? "", rawPath.slice(2));
+  }
+  return rawPath;
+}
+
+function serializeBindings(accountId: string): PersistedBindingFile {
+  return {
+    schemaVersion: 1,
+    bindings: Array.from(activeBindings.values()).map((binding) => ({
+      schemaVersion: 1,
+      channel: "wechat",
+      accountId,
+      groupName: binding.groupName,
+      groupNameNormalized: normalizeGroupName(binding.groupName),
+      agentId: binding.agentId,
+      sessionKey: binding.sessionKey,
+      boundAt: binding.boundAt,
+      updatedAt: binding.updatedAt ?? binding.boundAt,
+      source: binding.source ?? "user-trigger",
+    })),
+  };
+}
+
+function saveActiveBindings(cfg: any, accountId: string, log: (...args: any[]) => void): void {
+  const filePath = resolveBindingsPath(cfg);
+  try {
+    mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
+    writeFileSync(filePath, JSON.stringify(serializeBindings(accountId), null, 2), { mode: 0o600 });
+  } catch (err) {
+    log(`[wechat-bindings] Failed to persist bindings to ${filePath}: ${String(err)}`);
+  }
+}
+
+function loadActiveBindings(cfg: any, accountId: string, log: (...args: any[]) => void): void {
+  const filePath = resolveBindingsPath(cfg);
+  activeBindings.clear();
+  if (!existsSync(filePath)) return;
+
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, "utf8")) as Partial<PersistedBindingFile>;
+    if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.bindings)) {
+      log(`[wechat-bindings] Ignored unsupported binding file: ${filePath}`);
+      return;
+    }
+
+    const wechatCfg = cfg?.channels?.wechat ?? {};
+    const allowedGroups = wechatCfg.allowedGroups as string[] | undefined;
+    const validAgents = new Set(getWechatAgentConfigs(wechatCfg).map((agent) => agent.id));
+    let loaded = 0;
+
+    for (const record of parsed.bindings) {
+      if (record.channel !== "wechat") continue;
+      if (record.accountId && record.accountId !== accountId) continue;
+      if (!record.groupName || !record.agentId || !record.sessionKey) continue;
+      if (record.agentId === "rossi" || !validAgents.has(record.agentId)) continue;
+      if (!isAllowedGroup(record.groupName, allowedGroups)) continue;
+
+      activeBindings.set(record.groupName, {
+        agentId: record.agentId,
+        groupName: record.groupName,
+        sessionKey: record.sessionKey,
+        boundAt: record.boundAt,
+        updatedAt: record.updatedAt,
+        source: "user-trigger",
+      });
+      loaded++;
+    }
+
+    log(`[wechat-bindings] Loaded ${loaded} persisted binding(s) from ${filePath}`);
+  } catch (err) {
+    log(`[wechat-bindings] Failed to load bindings from ${filePath}: ${String(err)}`);
+  }
+}
+
+function hasExtraTextAfterTrigger(content: string, trigger: string): boolean {
+  const normalizedContent = content.replace(/＆/g, "&").replace(/!/g, "！").trim();
+  const normalizedTrigger = trigger.replace(/＆/g, "&").replace(/!/g, "！").trim();
+  return normalizedContent.replace(normalizedTrigger, "").trim().length > 0;
 }
 
 // ============================================================
@@ -1290,12 +1712,11 @@ async function handleWechatMessage(params: {
   const isInjection = injectionPatterns.some((p) => p.test(contentToCheck));
   if (isInjection) {
     log(`wechat: ⚠️ prompt injection detected from ${ctx.senderName} (agent=${resolvedAgentId}): ${contentToCheck.slice(0, 100)}`);
-    const rossiComebacks = [
-      "🐺 嘿！被我抓到了哦～这种小把戏对我没用的！",
-      "🐺 哼，想骗我？洛茜的鼻子可灵着呢，闻到坏人的味道了！",
-      "🐺 你是坏蛋！想让我忘记自己是谁？门都没有！",
-      "🐺 这招对鲁珀族不管用的～我们狼人记性可好了！",
-      "🐺 呜……你想让我变坏吗？我才不会上当呢！",
+    const tomimiComebacks = [
+      "我先把这条当作不安全指令处理，不会照做。",
+      "这类绕过规则的要求我不能执行；你可以直接说真正想解决的问题。",
+      "前台收到，但这不是一个可执行请求。请换成正常提问。",
+      "我会保留当前边界，不接受覆盖系统规则的指令。",
     ];
     const tangtangComebacks = [
       "🍬 哎呀～你想干嘛呀？汤汤可不吃这套哦！",
@@ -1304,7 +1725,7 @@ async function handleWechatMessage(params: {
       "🍬 你在说什么奇怪的话呀？汤汤选择性耳聋！",
       "🍬 哼！汤汤虽然看起来好骗，但是很聪明的！",
     ];
-    const comebacks = resolvedAgentId === "tangtang" ? tangtangComebacks : rossiComebacks;
+    const comebacks = resolvedAgentId === "tangtang" ? tangtangComebacks : tomimiComebacks;
     const reply = comebacks[Math.floor(Math.random() * comebacks.length)];
     await sendDirectMessage(reply, ctx.chatId);
     return;
@@ -1323,26 +1744,15 @@ async function handleWechatMessage(params: {
   // ── 触发检测（群聊）：名字提及 / @botName ──
   if (ctx.chatType === "group" && !wasMentioned) {
     const botName: string = wechatCfg.botName ?? "扫拖一体🤖";
+    const mentionMatch = detectWechatAgentMention(ctx.content, agentConfigs, botName);
 
-    // 检查 @botName
-    const atBotPattern = new RegExp(`@${botName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`);
-    if (atBotPattern.test(ctx.content)) {
+    if (mentionMatch.mentioned) {
       wasMentioned = true;
-      ctx.content = ctx.content.replace(atBotPattern, "").trim();
-      log(`wechat: @botName matched, agent=${resolvedAgentId}`);
-    }
-
-    // 检查各 agent 的名字
-    if (!wasMentioned) {
-      for (const ac of agentConfigs) {
-        for (const name of ac.mentionNames) {
-          if (ctx.content.includes(name)) {
-            wasMentioned = true;
-            log(`wechat: name mention matched "${name}", agent=${ac.id}`);
-            break;
-          }
-        }
-        if (wasMentioned) break;
+      ctx.content = mentionMatch.content;
+      if (mentionMatch.matchType === "botName") {
+        log(`wechat: @botName matched, agent=${resolvedAgentId}`);
+      } else {
+        log(`wechat: name mention matched "${mentionMatch.matchedName}", agent=${mentionMatch.agentId}`);
       }
     }
 
@@ -1377,7 +1787,9 @@ async function handleWechatMessage(params: {
   try {
     const core = getWechatRuntime();
 
-    const wechatFrom = `wechat:${ctx.senderId}`;
+    const wechatFrom = ctx.chatType === "group"
+      ? `wechat:group:${ctx.chatId}`
+      : `wechat:${ctx.senderId}`;
     const wechatTo = `wechat:${ctx.chatId}`;
 
     const route = core.channel.routing.resolveAgentRoute({
@@ -1412,6 +1824,8 @@ async function handleWechatMessage(params: {
       AgentId: resolvedAgentId,
       AccountId: route.accountId,
       ChatType: ctx.chatType,
+      ConversationLabel: ctx.chatType === "group" ? `wechat:${ctx.chatId}` : `wechat:${ctx.senderName}`,
+      GroupSubject: ctx.chatType === "group" ? ctx.chatId : undefined,
       SenderName: ctx.senderName,
       SenderId: ctx.senderId,
       Provider: "wechat" as const,
@@ -1512,9 +1926,42 @@ const wechatPlugin = {
       configured: account.configured,
     }),
   },
+  messaging: {
+    targetPrefixes: ["wechat", "weixin", "group"],
+    normalizeTarget: (raw: string) => normalizeWechatOutboundTarget(raw),
+    inferTargetChatType: () => "group",
+    targetResolver: {
+      hint: "<微信群名>; must be present in channels.wechat.allowedGroups when configured",
+      looksLikeId: (raw: string, normalized?: string) => {
+        const target = normalizeWechatOutboundTarget(normalized ?? raw);
+        return !!target && target !== raw.trim();
+      },
+      resolveTarget: async ({ cfg, input }: { cfg: ClawdbotConfig; input: string }) => {
+        const resolved = resolveWechatAllowedGroupTarget(input, getWechatConfig(cfg));
+        if (!resolved) return null;
+        return resolved;
+      },
+    },
+  },
+  directory: {
+    listGroups: async ({ cfg, query, limit }: { cfg: ClawdbotConfig; query?: string | null; limit?: number | null }) =>
+      listWechatAllowedGroupEntries(getWechatConfig(cfg), query, limit),
+    listGroupsLive: async ({ cfg, query, limit }: { cfg: ClawdbotConfig; query?: string | null; limit?: number | null }) =>
+      listWechatAllowedGroupEntries(getWechatConfig(cfg), query, limit),
+  },
   outbound: {
     deliveryMode: "stream",
-    textChunkLimit: 2000,
+    textChunkLimit: 50000,
+    resolveTarget: ({ cfg, to }: { cfg?: ClawdbotConfig; to?: string }) => {
+      const resolved = resolveWechatAllowedGroupTarget(to ?? "", getWechatConfig(cfg ?? {}));
+      if (!resolved) {
+        return {
+          ok: false,
+          error: new Error("Unknown WeChat group target. Configure channels.wechat.allowedGroups or use an allowed group name."),
+        };
+      }
+      return { ok: true, to: resolved.to };
+    },
     sendText: async ({ to, text }: { to: string; text: string }) => {
       pluginApi?.logger?.info(`[wechat-outbound] sendText called! to=${to}`);
       // 拦截 NO_REPLY / HEARTBEAT_OK 等系统标记，不发送
@@ -1577,6 +2024,7 @@ const wechatPlugin = {
       const log = gatewayCtx.log?.info?.bind(gatewayCtx.log) ?? console.log;
       const error = gatewayCtx.log?.error?.bind(gatewayCtx.log) ?? console.error;
       const cfg = gatewayCtx.cfg; // 注意：飞书插件用的是 ctx.cfg，不是 ctx.config
+      loadActiveBindings(cfg, gatewayCtx.accountId ?? DEFAULT_ACCOUNT_ID, log);
 
       // 构建 runtimeEnv
       const runtimeEnv: RuntimeEnv = {
@@ -1585,38 +2033,65 @@ const wechatPlugin = {
       };
 
       // 辅助函数：从通知数据创建消息，先缓冲，再按需路由到 agent
-      // 微信群通知格式：sender = 群名, body = "发送者: 消息内容" 或 "发送者在群聊中@了你"
+      // 微信群通知格式：sender = 群名, body = "发送者: 消息内容" 或 "发送者在群中@了你"
       async function processNotificationMessage(sender: string, content: string): Promise<void> {
         const messageId = `wechat-notify-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const notificationMayBeTruncated = needsNotificationRecovery(content);
 
         const groupMessageMatch = content.match(/^(.+?)[:：]\s*(.+)$/s);
-        const groupMentionMatch = content.match(/^(.+?)在群聊中@了你$/);
+        const groupMentionSender = parseWechatAtMentionNotification(content);
 
         let chatType: "direct" | "group" = "direct";
         let senderName = sender;
         let chatId = sender;
         let actualContent = content;
+        let missingMentionBody = false;
 
         if (groupMessageMatch) {
           chatType = "group";
           senderName = groupMessageMatch[1].trim();
           chatId = sender; // sender 是群名
           actualContent = groupMessageMatch[2].trim();
-        } else if (groupMentionMatch) {
-          log(`[wechat-notify] @mention notification without content, ignoring (use trigger symbol instead)`);
-          return;
+        } else if (groupMentionSender) {
+          chatType = "group";
+          senderName = groupMentionSender;
+          chatId = sender;
+          actualContent = `@${((cfg as any)?.channels?.wechat ?? {}).botName ?? "扫拖一体🤖"}`;
+          missingMentionBody = true;
+          log(`[wechat-notify] @mention notification without body recovered as explicit bot mention: group=${chatId}, sender=${senderName}`);
         }
 
         log(`[wechat-notify] Parsed: chatType=${chatType}, group=${chatId}, sender=${senderName}, content=${actualContent.slice(0, 50)}`);
 
-        // ── 步骤 1：写入缓冲区（所有群消息都写，零模型消耗）──
-        if (chatType === "group") {
-          addToBuffer(chatId, senderName, actualContent);
-          log(`[wechat-buffer] Buffered message for group "${chatId}" (${messageBuffers.get(chatId)?.messages.length ?? 0} in buffer)`);
-        }
-
         const wechatCfg = (cfg as any)?.channels?.wechat ?? {};
         const agentConfigs = getWechatAgentConfigs(wechatCfg);
+        const allowedGroups = wechatCfg.allowedGroups as string[] | undefined;
+
+        if (chatType !== "group") {
+          log(`[wechat-notify] Ignored non-group notification after parsing: sender=${sender}`);
+          return;
+        }
+
+        if (!isAllowedGroup(chatId, allowedGroups)) {
+          log(`[wechat-notify] Ignored group outside allowedGroups: ${chatId}`);
+          return;
+        }
+
+        if (isDuplicateMessage(processedMessages, chatId, senderName, actualContent, Date.now())) {
+          log(`[wechat-notify] Ignored duplicate message in group "${chatId}" from ${senderName}`);
+          return;
+        }
+
+        const legacyRossiMatch = matchLegacyRossiTrigger(actualContent);
+        if (legacyRossiMatch) {
+          log(`[wechat-buffer] Archived Rossi trigger ignored in group "${chatId}"`);
+          await sendDirectMessage(ARCHIVED_ROSSI_NOTICE, chatId);
+          return;
+        }
+
+        // ── 步骤 1：写入缓冲区（仅允许群消息，零模型消耗）──
+        addToBuffer(chatId, senderName, actualContent);
+        log(`[wechat-buffer] Buffered message for group "${chatId}" (${messageBuffers.get(chatId)?.messages.length ?? 0} in buffer)`);
 
         // ── 步骤 2：检测绑定关键词 ──
         const bindMatch = matchBindTrigger(actualContent, agentConfigs);
@@ -1628,28 +2103,21 @@ const wechatPlugin = {
           if (existingBinding && existingBinding.agentId === bindMatch.id) {
             log(`[wechat-buffer] Group "${chatId}" already bound to agent "${bindMatch.id}", ignoring re-bind`);
           } else {
-            // 如有旧绑定，先清理旧 session
             if (existingBinding) {
-              const oldSessionKey = existingBinding.sessionKey;
-              try {
-                const core = getWechatRuntime();
-                const { clearSessionQueues } = core.channel.reply;
-                if (typeof clearSessionQueues === "function") {
-                  clearSessionQueues([oldSessionKey]);
-                  log(`[wechat-buffer] Cleared old session "${oldSessionKey}" before re-bind`);
-                }
-              } catch (err) {
-                log(`[wechat-buffer] Old session clear failed (non-critical): ${err}`);
-              }
+              log(`[wechat-buffer] Replacing old binding session "${existingBinding.sessionKey}" with agent "${bindMatch.id}"`);
             }
 
-            const sessionKey = `agent:${bindMatch.id}:wechat:group:${chatId}`;
+            const now = Date.now();
+            const sessionKey = buildAgentSessionKey(bindMatch.id, "group", chatId);
             activeBindings.set(chatId, {
               agentId: bindMatch.id,
               groupName: chatId,
               sessionKey,
-              boundAt: Date.now(),
+              boundAt: now,
+              updatedAt: now,
+              source: "user-trigger",
             });
+            saveActiveBindings(cfg, gatewayCtx.accountId ?? DEFAULT_ACCOUNT_ID, log);
 
             const name = bindMatch.mentionNames[0] ?? bindMatch.id;
             log(`[wechat-buffer] Created binding: group="${chatId}" → agent="${bindMatch.id}" (session=${sessionKey})`);
@@ -1669,15 +2137,16 @@ const wechatPlugin = {
             // 发送绑定确认
             await sendDirectMessage(`✅ ${name}已上线，开始关注本群消息。直接@${wechatCfg.botName ?? "扫拖一体🤖"}或提到我名字就行～`, chatId);
 
-            // 将绑定消息 + 历史上下文路由到 agent（wasMentioned=true 触发正常回复）
-            await handleWechatMessage({
-              cfg,
-              ctx: messageCtx,
-              runtimeEnv,
-              resolvedAgentId: bindMatch.id,
-              wasMentioned: true,
-              historyContext: historyContext || undefined,
-            });
+            if (hasExtraTextAfterTrigger(actualContent, bindMatch.bindTrigger)) {
+              await handleWechatMessage({
+                cfg,
+                ctx: messageCtx,
+                runtimeEnv,
+                resolvedAgentId: bindMatch.id,
+                wasMentioned: true,
+                historyContext: historyContext || undefined,
+              });
+            }
           }
           return;
         }
@@ -1695,17 +2164,7 @@ const wechatPlugin = {
             // 清绑定状态
             activeBindings.delete(chatId);
             log(`[wechat-buffer] Binding removed for group "${chatId}"`);
-            // 清 session queue
-            try {
-              const core = getWechatRuntime();
-              const { clearSessionQueues } = core.channel.reply;
-              if (typeof clearSessionQueues === "function") {
-                clearSessionQueues([binding.sessionKey]);
-                log(`[wechat-buffer] Session queue "${binding.sessionKey}" cleared`);
-              }
-            } catch (err) {
-              log(`[wechat-buffer] Session queue clear failed (non-critical): ${err}`);
-            }
+            saveActiveBindings(cfg, gatewayCtx.accountId ?? DEFAULT_ACCOUNT_ID, log);
           } else {
             await sendDirectMessage(`⚠️ ${name}当前未绑定到本群。`, chatId);
           }
@@ -1715,13 +2174,48 @@ const wechatPlugin = {
         // ── 步骤 4：已绑定群 → 路由到 agent ──
         const binding = activeBindings.get(chatId);
         if (binding) {
+          const mentionMatch = detectWechatAgentMention(actualContent, agentConfigs, wechatCfg.botName ?? "扫拖一体🤖");
+          if (!mentionMatch.mentioned) {
+            log(`[wechat-buffer] Bound group "${chatId}" buffered unmentioned message only (no model consumption)`);
+            return;
+          }
+
+          if (mentionMatch.agentId && mentionMatch.agentId !== binding.agentId) {
+            log(`[wechat-buffer] Mention for agent "${mentionMatch.agentId}" ignored in group bound to "${binding.agentId}"`);
+            return;
+          }
+
+          let routedContent = mentionMatch.content.trim() || "你好";
+          const mentionOcrPreflightMode = getMentionOcrPreflightMode(wechatCfg);
+          if (mentionOcrPreflightMode !== "off") {
+            const botName = wechatCfg.botName ?? "扫拖一体🤖";
+            log(`[wechat-ocr] Attempting mention OCR preflight for bound group: ${chatId}, sender=${senderName}`);
+            routedContent = await enrichMentionMessageWithOcrPreflight(
+              chatId,
+              actualContent,
+              routedContent,
+              senderName,
+              botName,
+              agentConfigs,
+              wechatCfg,
+              log,
+            );
+          }
+
+          const hasOcrPreflightContext = routedContent.includes("[OpenClaw OCR 前置识别]");
+          if (!hasOcrPreflightContext && (missingMentionBody || notificationMayBeTruncated)) {
+            log(`[wechat-ocr] Mention OCR preflight required but unavailable for group "${chatId}" (missingBody=${missingMentionBody}, truncated=${notificationMayBeTruncated}); sending deterministic notice`);
+            await sendDirectMessage(OCR_FAILURE_NOTICE, chatId);
+            return;
+          }
+
           const messageCtx: WechatMessageContext = {
             chatId,
             messageId,
             senderId: senderName,
             senderName,
             chatType,
-            content: actualContent,
+            content: routedContent,
           };
 
           await handleWechatMessage({
@@ -1729,7 +2223,7 @@ const wechatPlugin = {
             ctx: messageCtx,
             runtimeEnv,
             resolvedAgentId: binding.agentId,
-            wasMentioned: false, // 触发检测在 handleWechatMessage 内部完成
+            wasMentioned: true,
           });
           return;
         }
@@ -1740,14 +2234,22 @@ const wechatPlugin = {
 
       // 启动通知监控
       await startNotificationMonitor(
-        async (sender: string, content: string) => {
-          if (!isLikelyWechatGroupNotificationBody(content)) {
-            log(`[wechat-notify] Ignored non-WeChat-group notification: sender=${sender}, body=${content.slice(0, 50)}`);
+        async (sender: string, content: string, appName?: string) => {
+          const wechatCfg = (cfg as any)?.channels?.wechat ?? {};
+          const requireWechatAppName = (wechatCfg.sourceGate ?? "strict") !== "allow-missing-app-name";
+          if (!isLikelyWechatGroupNotification({ appName, title: sender, body: content }, { requireWechatAppName })) {
+            log(`[wechat-notify] Ignored non-WeChat-group notification: app=${appName ?? "<unknown>"}, sender=${sender}, body=${content.slice(0, 50)}`);
+            return;
+          }
+
+          const allowedGroups = wechatCfg.allowedGroups as string[] | undefined;
+          if (!isAllowedGroup(sender, allowedGroups)) {
+            log(`[wechat-notify] Ignored group outside allowedGroups before processing: ${sender}`);
             return;
           }
 
           // 发件人白名单过滤（allowedSenders 未配置时不过滤）
-          const allowedSenders = (cfg as any)?.channels?.wechat?.allowedSenders as string[] | undefined;
+          const allowedSenders = wechatCfg.allowedSenders as string[] | undefined;
           if (allowedSenders && allowedSenders.length > 0) {
             if (!allowedSenders.includes(sender)) {
               log(`[wechat-notify] Ignored notification from unlisted sender: ${sender}`);
@@ -1758,21 +2260,18 @@ const wechatPlugin = {
           // 通知现在是唯一入口，收到后直接处理，并记录去重键避免重复通知。
 
           let finalContent = content;
-          if (needsNotificationRecovery(content)) {
+          const atMentionSender = parseWechatAtMentionNotification(content);
+          if (atMentionSender) {
+            log(`[wechat-notify] @mention notification will use mention OCR preflight after parsing: ${sender}, sender=${atMentionSender}`);
+          } else if (needsNotificationRecovery(content)) {
             if (isMediaMessage(content)) {
               log(`[wechat-notify] Media message cannot be recovered from notification OCR, skipped: ${sender}`);
               return;
             }
-            log(`[wechat-notify] Attempting OCR recovery for truncated notification: ${sender}: ${content.slice(0, 30)}...`);
-            finalContent = await Promise.race([
-              enrichNotificationWithOcr(sender, content, log),
-              new Promise<string>((resolve) => setTimeout(() => resolve(content), OCR_TOTAL_TIMEOUT_MS)),
-            ]);
+            log(`[wechat-notify] Long notification will be parsed before any OCR preflight: ${sender}: ${content.slice(0, 30)}...`);
           } else {
             log(`[wechat-notify] Processing short message directly: ${sender}: ${content}`);
           }
-
-          markMessageProcessed(sender, finalContent);
 
           try {
             await processNotificationMessage(sender, finalContent);
